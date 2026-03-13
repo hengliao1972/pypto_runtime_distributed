@@ -31,7 +31,7 @@ void LinquScopeStack::scope_end(
         int32_t tid = scope_tasks_[i];
         LinquTaskDescriptor* desc = get_desc(tid, ctx);
         if (!desc->task_freed) {
-            desc->ref_count++;
+            desc->fanout_refcount++;
         }
     }
     scope_tasks_size_ = begin;

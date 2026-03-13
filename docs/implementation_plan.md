@@ -1,10 +1,12 @@
 # Linqu Distributed Runtime — Detailed Implementation Plan
 
-This plan breaks down Phase 0 of the Linqu runtime design into small, concrete steps with specific goals, deliverables, and acceptance criteria. Phase 0 targets a **single-host (Level 3) environment** building on `simpler` for Levels 0–2, with all software forward-compatible with the full 7-layer system.
+This plan breaks down Phase 0 of the Linqu runtime design into small, concrete steps with specific goals, deliverables, and acceptance criteria. Phase 0 targets a **single-host (Level 3) environment** with all software forward-compatible with the full 7-layer system. All code lives within `pypto_runtime_distributed` — no dependency on or modification to `simpler`.
 
-**Key Assumption:** A PyPTO front-end compiler already generates C++ functions tagged with hierarchy levels (L0–L6). These functions follow the `simpler` orchestration pattern — using `TensorMap`, `Tensor`, `PTOParam`, `PTO2_SCOPE`, and `pto2_rt_submit_task()` — nested at different hierarchy levels. The Linqu runtime compiles these functions into arm64 shared libraries (`.so`) and dispatches them to the appropriate hierarchy node for execution.
+**Key Assumption:** A PyPTO front-end compiler already generates C++ functions tagged with hierarchy levels (L0–L6). For Levels 3–6, these functions use the Linqu runtime API (`LinquRuntime*`, `LinquRuntimeOps`, `LINQU_SCOPE`, `linqu_submit_task`). For Levels 0–2, `simpler` has its own API (`PTO2Runtime*`, `PTO2RuntimeOps`, `PTO2_SCOPE`, `pto2_rt_submit_task`). The Linqu runtime compiles L3–L6 functions into arm64 shared libraries (`.so`) and dispatches them to the appropriate hierarchy node for execution.
 
-**Execution Model:** At every level, an orchestration function runs as a **single process** that submits tasks to **multiple instances at the next lower level**. For example, L3 (host) is a single process that orchestrates work across many L2 chips — this is exactly what `simpler`'s orchestration function already does. The same pattern repeats at L4 (one process → many L3 hosts), L5 (one process → many L4 pods), and L6 (one process → many L5 supernodes). The runtime API, ring buffers, TensorMap, and scope stack are therefore identical at every level; only the dispatch transport differs.
+**Scope Boundary — `simpler` Is Not Modified or Linked:** The `simpler` runtime (Levels 0–2) is a **separate, immutable codebase** (`pypto_workspace/simpler/`). This project (`pypto_runtime_distributed`) does **NOT** link against `simpler`, does **NOT** include `simpler` headers, and does **NOT** call any `simpler` API. The two runtimes are completely independent codebases. Integration between Linqu (L3+) and `simpler` (L0–L2) is achieved at a well-defined **Tier 2 adapter boundary** (see §7.4 of `linqu_runtime_design.md`), which will be implemented in a future phase when actual chip hardware is available. In Phase 0, the L3 daemon's downward dispatch to L2 is **stubbed** — it simulates chip-level task execution without calling into `simpler`.
+
+**Execution Model:** At every level, an orchestration function runs as a **single process** that submits tasks to **multiple instances at the next lower level**. For example, L4 (pod) is a single process that orchestrates work across many L3 hosts. The same pattern repeats at L5 (one process → many L4 pods) and L6 (one process → many L5 supernodes). The runtime API, ring buffers, TensorMap, and scope stack are identical at every level (L3–L6); only the dispatch transport differs. At the L3→L2 boundary, a future `ChipBackend` adapter will translate Linqu dispatch calls into `simpler` API calls with `h2d_copy`/`d2h_copy` for host↔device data transfer.
 
 **Per-Level Process Isolation (Fundamental Constraint):** Every hierarchy level runs its orchestration function and runtime in a **dedicated, independent OS process**. Levels do NOT share address space. All cross-level communication goes through IPC (Unix domain sockets in the verification environment, TCP/RDMA in production). This means:
 
@@ -14,7 +16,7 @@ Process model for the 1024-node virtual cluster:
   1 × L6 process   — runs topo_L6_cluster.so   — dispatches via IPC to L5 processes
  16 × L5 processes — each runs topo_L5_supernode.so — dispatches via IPC to L4 processes
  64 × L4 processes — each runs topo_L4_pod.so   — dispatches via IPC to L3 processes
-1024 × L3 processes — each runs topo_L3_host.so  — dispatches via simpler to L2 (chip)
+1024 × L3 processes — each runs topo_L3_host.so  — stub dispatch to L2 (future: ChipBackend → simpler)
 ─────────────────
 Total: 1105 processes for the full cluster
 ```
@@ -32,6 +34,37 @@ This ensures:
 - A crash at one level does not corrupt another level's state.
 - The same isolation model applies whether processes are on the same machine (verification) or different machines (production).
 
+**Three-Tier Communication Architecture:** The hierarchy has three fundamentally different communication tiers, each with distinct memory models and synchronization mechanisms. Understanding this is critical for correct implementation:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Tier 3: Message Passing (L4–L6 ↔ L3)                              │
+│  Unix Socket / TCP / RDMA                                           │
+│  Serialized messages: CALL_TASK, TASK_COMPLETE, SHUTDOWN            │
+│  Each node: independent process, independent address space          │
+├─────────────────────────────────────────────────────────────────────┤
+│  Tier 2: Host-Device DMA (L3 ↔ L2)                                 │
+│  h2d_copy / d2h_copy                                                │
+│  L3 = Host CPU (host memory), L2 = Device (device GM)              │
+│  Different memory domains — no shared address space                 │
+│  Data transfer: explicit DMA between host memory and device GM      │
+├─────────────────────────────────────────────────────────────────────┤
+│  Tier 1: Shared Device GM (L0–L2, managed by simpler)               │
+│  Atomic operations + memory barriers (LOAD_ACQUIRE / STORE_RELEASE) │
+│  Orchestrator + Scheduler + Workers share same GM address space     │
+│  Zero-copy: pointer passing via ring buffers in device GM           │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+This has key implications for the Linqu runtime implementation:
+
+1. **Linqu's `LinquOrchestratorState` (L3–L6) uses `std::mutex`, NOT atomics.** There is no shared memory between levels — synchronization is for thread safety (recv thread vs. main thread within one process), not cross-process coordination.
+2. **Linqu's TensorMap uses opaque integer handles, NOT device GM addresses.** At L3–L6 there is no shared buffer space, so multi-dimensional overlap detection (which `simpler` uses on GM addresses) is unnecessary. Handle-based exact-match tracking is correct.
+3. **The L3 NodeDaemon will bridge Tier 2 and Tier 3 (future phase).** It receives CALL_TASK from L4 via Unix socket (Tier 3). In Phase 0, L2 dispatch is stubbed. In a future phase, the `ChipBackend` adapter will call `h2d_copy` to push data to device GM (Tier 2), invoke `simpler` for chip execution, call `d2h_copy` to pull results back, and send TASK_COMPLETE to L4 (Tier 3). This adapter lives in `pypto_runtime_distributed` and calls `simpler` through a stable ABI — it does NOT modify `simpler`.
+4. **Back-pressure at L3–L6 is message-driven.** When rings are full, the orchestrator spins waiting for `TASK_COMPLETE` messages (triggering `on_task_complete` → `propagate_completion` → `try_advance_ring_pointers`), not on `LOAD_ACQUIRE(last_task_alive)` in shared memory.
+
+See `linqu_runtime_design.md` §7.4 for the full specification.
+
 **All test programs are implemented as "pypto kernels"** — C/C++ functions that look exactly like what the PyPTO compiler would emit after processing a `pl.at(level=...)` program. We skip the PyPTO compilation step and hand-write the compiler output directly. Each function:
 - Has a `level` tag (the hierarchy level it runs at).
 - Uses the **unified ops-table API** (`LinquRuntime*` / `LinquRuntimeOps`) at all levels L0–L6.
@@ -47,9 +80,9 @@ Reference: `pypto_top_level_design_documents/linqu_runtime_design.md`
 
 ---
 
-## Milestone 1: Project Scaffolding and `simpler` Interface Study
+## Milestone 1: Project Scaffolding
 
-**Goal:** Set up the repository structure, build system, and thoroughly understand the `simpler` API surface that the Linqu runtime will adapt to.
+**Goal:** Set up the repository structure and build system. This project is **self-contained** — it does NOT link against or include headers from `simpler`. All code lives within `pypto_runtime_distributed`.
 
 ### Step 1.1: Repository Structure
 
@@ -62,7 +95,7 @@ pypto_runtime_distributed/
 │   ├── core/                 # Hierarchy model, identity, coordinates
 │   ├── ring/                 # Multi-layer ring buffer implementation
 │   ├── scope/                # ScopeManager for Level 3+
-│   ├── runtime/              # LinquOrchestratorState, dispatchers, simpler adapter
+│   ├── runtime/              # LinquOrchestratorState, dispatchers
 │   ├── transport/            # RPC protocol, message header, IPC
 │   ├── discovery/            # PeerRegistry, gossip, coordinate mapping
 │   ├── dispatch/             # pl.at() dispatch, SPMD fan-out
@@ -70,13 +103,10 @@ pypto_runtime_distributed/
 │   └── profiling/            # Ring metrics, JSON output
 ├── tests/
 │   ├── unit/                 # Per-module unit tests
-│   ├── integration/          # simpler integration tests
 │   ├── forward_compat/       # Mock 7-level topology tests
 │   └── e2e/                  # End-to-end multi-process tests
 ├── examples/
 │   └── hierarchical_vecadd/  # THE hierarchical test program
-│       ├── kernels/          # L0 compute kernels (compiled by simpler)
-│       ├── L2_chip_orch.cpp  # Chip-level orchestration function
 │       ├── L3_host_orch.cpp  # Host-level orchestration function
 │       ├── L4_pod_orch.cpp   # Pod-level orchestration function
 │       ├── L5_super_orch.cpp # Supernode-level orchestration function
@@ -93,39 +123,37 @@ pypto_runtime_distributed/
 
 ### Step 1.2: Language and Build Decision
 
-**Action:** C++ (matching `simpler`). All orchestration functions compile into `.so` shared libraries with `extern "C"` entry points, exactly like `simpler`'s `example_orchestration.cpp`. The Linqu runtime loads them via `dlopen`/`dlsym`.
+**Action:** C++. All orchestration functions compile into `.so` shared libraries with `extern "C"` entry points. The Linqu runtime loads them via `dlopen`/`dlsym`.
 
 The CMake build system must:
 - Cross-compile or natively compile for **aarch64** (arm64).
-- Link against `simpler`'s `libhost_runtime.so` for Level 0–2 execution.
+- Build as a **standalone project** — no dependency on `simpler` or any external runtime library.
 - Produce per-level `.so` files for each orchestration function.
 - Build the `linqu_daemon` executable (the node process).
 
 **Deliverable:** `CMakeLists.txt` at project root, verified to compile on the arm64 server.
 
-### Step 1.3: Study `simpler` API Surface
+### Step 1.3: Document `simpler` API Surface (Read-Only Reference)
 
-**Action:** Read `pypto_workspace/simpler/` source to identify and document:
+**Action:** Read `pypto_workspace/simpler/` source to **document** (not link against) the `simpler` API. This is a read-only study to understand the API that the future `ChipBackend` adapter will need to call. The output is a reference document — no code in `pypto_runtime_distributed` depends on it in Phase 0.
 
-1. **`PTO2RuntimeOps` function-pointer table** — the orchestration `.so` calls runtime operations through this table: `submit_task`, `scope_begin`, `scope_end`, `orchestration_done`.
-2. **`PTO2Runtime*`** — opaque runtime context passed to orchestration entry.
-3. **`aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count)`** — the standard entry signature for orchestration `.so` files.
-4. **`aicpu_orchestration_config(uint64_t* args, int arg_count) → PTO2OrchestrationConfig`** — configuration export from `.so`.
-5. **`Tensor`, `PTOParam`, `make_tensor()`, `make_tensor_external()`, `make_input_param()`, `make_output_param()`** — tensor descriptor and parameter factory API.
-6. **`PTO2_SCOPE(rt) { ... }`** — RAII scope management macro.
-7. **`pto2_rt_submit_task(rt, kernel_id, worker_type, params, num_params)`** — task submission through ops table.
-8. **`pto2_runtime_create()` / `pto2_runtime_destroy()`** — runtime lifecycle.
-9. **Shared Memory** — `PTO2SharedMemoryHandle`, used to share task descriptors between orchestrator and scheduler.
+Key `simpler` APIs to document for future adapter work:
 
-**Deliverable:** `docs/simpler_api_contract.md` — concise reference of every `simpler` API the Linqu runtime needs, with signatures and behavior.
+1. **`PTO2RuntimeOps` function-pointer table** — `submit_task`, `scope_begin`, `scope_end`, `orchestration_done`.
+2. **`PTO2Runtime*`** — opaque runtime context.
+3. **`aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count)`** — standard entry signature.
+4. **`PTO2SharedMemoryHandle`** — shared memory between host CPU and device.
+5. **h2d/d2h DMA API** — mechanism for transferring data between host memory and device GM.
 
-**Acceptance:** A peer can read this document and understand how to write an orchestration `.so` and how to call `simpler` without reading `simpler` source.
+**Deliverable:** `docs/simpler_api_contract.md` — reference document for the future `ChipBackend` adapter.
+
+**Acceptance:** A peer can read this document and understand the Tier 2 boundary that the future adapter must bridge. No code in `pypto_runtime_distributed` includes or links `simpler` headers/libraries.
 
 ---
 
 ## Milestone 1B: Unified Runtime API and Implementation — Same Code at Every Level
 
-**Goal:** Design and implement a **single, level-parameterized runtime** that provides the same API to orchestration functions at every hierarchy level (L0–L6). The API mirrors `simpler`'s `PTO2Runtime` / `PTO2RuntimeOps` pattern exactly. The same runtime implementation code is instantiated once per level — no separate code paths for L3 vs L4 vs L5 vs L6. At L0–L2, the Linqu runtime delegates to `simpler`'s existing `PTO2OrchestratorState`; at L3–L6 it uses its own equivalent.
+**Goal:** Design and implement a **single, level-parameterized runtime** that provides the same API to orchestration functions at every hierarchy level (L3–L6). The API follows the same ops-table pattern used by `simpler` (`PTO2Runtime` / `PTO2RuntimeOps`) but is an independent implementation. The same runtime implementation code is instantiated once per level — no separate code paths for L3 vs L4 vs L5 vs L6. L0–L2 execution is handled by `simpler` (a separate, unmodified codebase); integration between Linqu and `simpler` will be implemented in a future phase via a `ChipBackend` adapter that does NOT modify `simpler`.
 
 ### Fundamental Architectural Principle: Single-Process Orchestration over Multiple Lower-Level Instances
 
@@ -143,31 +171,32 @@ L3 orchestration (1 process)  ──submit_task──→   N × L2 instances (ch
 L2 orchestration (1 process)  ──submit_task──→   M × L0 instances (cores/core-groups)
 ```
 
-**L3 (Host) is the key example**: `simpler`'s orchestration function runs as a **single process** on the host CPU. It calls `pto2_submit_task()` to dispatch work to **multiple L2 chips** on the same machine. The orchestration process owns the ring buffers, tensor map, and scope stack; the chips are the workers that execute the submitted tasks.
+**L4 (Pod) is the key example**: An L4 orchestration function runs as a **single process** on one host. It calls `linqu_submit_task()` to dispatch work to **multiple L3 hosts** in the same pod. The orchestration process owns the ring buffers, tensor map, and scope stack; the L3 hosts are the workers that execute the submitted tasks.
 
-This pattern repeats identically at every upper level:
-- L4 pod orchestration is a single process that submits tasks to multiple L3 hosts in the same pod.
-- L5 supernode orchestration is a single process that submits tasks to multiple L4 pods.
-- L6 cluster orchestration is a single process that submits tasks to multiple L5 supernodes.
+This pattern repeats identically at every level:
+- L3 host orchestration dispatches to L2 chips (future: via `ChipBackend` adapter calling `simpler`; Phase 0: stubbed).
+- L4 pod orchestration dispatches to multiple L3 hosts in the same pod.
+- L5 supernode orchestration dispatches to multiple L4 pods.
+- L6 cluster orchestration dispatches to multiple L5 supernodes.
 
 The runtime API is therefore always: **"I am a single orchestrator at level L. I call `submit_task(target, kernel, params)` to dispatch work to one of my child instances at level L−1. The runtime manages the ring buffers, dependency tracking (TensorMap), and scope lifetimes for my level."**
 
-This is why the same `LinquOrchestratorState` code works at every level — the logic is always: allocate task slot, look up input dependencies in TensorMap, register output in TensorMap, dispatch to child, track scope ownership. Only the dispatch mechanism changes (shared memory for L2→L0, IPC for L3→L2, network for L4+→L3+).
+This is why the same `LinquOrchestratorState` code works at every level (L3–L6) — the logic is always: allocate task slot, look up input dependencies in TensorMap, register output in TensorMap, dispatch to child, track scope ownership. Only the dispatch mechanism changes (IPC for same-machine processes, network for cross-machine). The L3→L2 boundary is special (Tier 2: h2d_copy/d2h_copy) and will be handled by a future `ChipBackend` adapter.
 
-### Design Principle: One Runtime, Seven Levels
+### Design Principle: One Runtime for L3–L6, Inspired by `simpler`
 
-`simpler` already provides a mature runtime for L0–L2 with these core subsystems:
+`simpler` provides a mature runtime for L0–L2 with proven subsystems. The Linqu runtime implements **equivalent algorithms** for L3–L6, adapted to work with local host memory instead of device shared memory. The table below shows the correspondence (for reference only — Linqu does NOT link against `simpler`):
 
-| Subsystem | simpler type | Role |
-|-----------|-------------|------|
-| Ops table | `PTO2RuntimeOps` | Function-pointer table exposed to orchestration `.so` |
-| Orchestrator state | `PTO2OrchestratorState` | Owns ring buffers, tensor map, scope stack, statistics |
-| Task ring | `PTO2TaskRing` | O(1) task slot allocation with back-pressure |
-| Heap ring | `PTO2HeapRing` | O(1) output buffer allocation with wrap-around |
-| Dep list pool | `PTO2DepListPool` | O(1) dependency list management |
-| TensorMap | `PTO2TensorMap` | Hash table mapping tensor→producer for dependency discovery |
-| Scope stack | Embedded in `PTO2OrchestratorState` | Tracks scope nesting and per-scope task lists |
-| Scheduler | `PTO2SchedulerState` | Dispatches ready tasks to workers |
+| Subsystem | simpler type (L0–L2, reference) | Linqu type (L3–L6, implemented) |
+|-----------|------|------|
+| Ops table | `PTO2RuntimeOps` | `LinquRuntimeOps` |
+| Orchestrator state | `PTO2OrchestratorState` | `LinquOrchestratorState` |
+| Task ring | `PTO2TaskRing` | `LinquTaskRing` |
+| Heap ring | `PTO2HeapRing` | `LinquHeapRing` |
+| Dep list pool | `PTO2DepListPool` | `LinquDepListPool` |
+| TensorMap | `PTO2TensorMap` (address-based overlap) | `LinquTensorMap` (handle-based exact match) |
+| Scope stack | Embedded in `PTO2OrchestratorState` | `LinquScopeStack` |
+| Scheduler | `PTO2SchedulerState` (device-side, atomics) | Message-driven in `LinquOrchestratorState` (mutex, TASK_COMPLETE) |
 
 The Linqu runtime provides the **identical set of subsystems** for L3–L6, with one critical generalization: **all subsystems are parameterized by `(level, depth)`** so a single `LinquOrchestratorState` instance can serve any level.
 
@@ -180,7 +209,7 @@ The Linqu runtime provides the **identical set of subsystems** for L3–L6, with
 │  coord: LinquCoordinate ← identity of this node                   │
 │                                                                    │
 │  ┌─────────────────────────────────────────────────────────┐      │
-│  │ Ring Buffers (identical to PTO2HeapRing / PTO2TaskRing) │      │
+│  │ Ring Buffers (LinquHeapRing / LinquTaskRing)            │      │
 │  │                                                         │      │
 │  │  task_ring[MAX_SCOPE_DEPTH]     — per-depth task slots  │      │
 │  │  buffer_ring[MAX_SCOPE_DEPTH]   — per-depth heap alloc  │      │
@@ -188,15 +217,15 @@ The Linqu runtime provides the **identical set of subsystems** for L3–L6, with
 │  └─────────────────────────────────────────────────────────┘      │
 │                                                                    │
 │  ┌─────────────────────────────────────────────────────────┐      │
-│  │ TensorMap (identical to PTO2TensorMap)                   │      │
+│  │ TensorMap (LinquTensorMap — handle-based exact match)    │      │
 │  │                                                         │      │
-│  │  Same hash-table + ring-buffer entry pool               │      │
-│  │  Same lazy invalidation, chain truncation, overlap det  │      │
-│  │  + cross-node extension: remote lookup + data transfer  │      │
+│  │  Hash-table + ring-buffer entry pool                    │      │
+│  │  Lazy invalidation, per-task chains, INOUT optimization │      │
+│  │  Opaque handles (not GM addresses — no overlap detect)  │      │
 │  └─────────────────────────────────────────────────────────┘      │
 │                                                                    │
 │  ┌─────────────────────────────────────────────────────────┐      │
-│  │ Scope Stack (identical to simpler's scope_tasks/begins)  │      │
+│  │ Scope Stack (LinquScopeStack)                            │      │
 │  │                                                         │      │
 │  │  scope_tasks[]       — flat buffer of task IDs          │      │
 │  │  scope_begins[]      — per-scope start index            │      │
@@ -204,20 +233,19 @@ The Linqu runtime provides the **identical set of subsystems** for L3–L6, with
 │  └─────────────────────────────────────────────────────────┘      │
 │                                                                    │
 │  ┌─────────────────────────────────────────────────────────┐      │
-│  │ Scheduler / Dispatcher                                   │      │
+│  │ Scheduler / Dispatcher (message-driven)                  │      │
 │  │                                                         │      │
-│  │  L0–L2: delegates to simpler's PTO2SchedulerState       │      │
-│  │  L3:    dispatches to local thread pool or simpler       │      │
+│  │  L3:    local execution or stub to L2 (future: adapter) │      │
 │  │  L4–L6: dispatches to child nodes via IPC/network       │      │
 │  └─────────────────────────────────────────────────────────┘      │
 │                                                                    │
-│  statistics, profiling, logging — same as simpler                  │
+│  statistics, profiling, logging                                    │
 └────────────────────────────────────────────────────────────────────┘
 ```
 
 ### The Unified Ops Table
 
-The orchestration `.so` at **every** level sees the **same** ops table type. There is no separate `PTO2RuntimeOps` vs `LinquRuntimeOps` — there is only `LinquRuntimeOps`, and for L0–L2, the Linqu runtime wraps `simpler`'s implementation behind this same ops table.
+The orchestration `.so` at every level (L3–L6) sees the **same** ops table type (`LinquRuntimeOps`). This is the Linqu runtime's own API — it is inspired by `simpler`'s `PTO2RuntimeOps` pattern but is an independent type defined in `pypto_runtime_distributed`. L0–L2 functions use `simpler`'s own `PTO2RuntimeOps` in a separate codebase.
 
 ```cpp
 // linqu_orchestration_api.h — THE SINGLE HEADER for all levels
@@ -300,25 +328,23 @@ typedef struct LinquPeerList {
 // LinquRuntimeOps — Unified ops table for ALL levels
 // =============================================================================
 //
-// This is the SINGLE ops table type used at every level from L0 to L6.
-// It mirrors simpler's PTO2RuntimeOps pattern: the orchestration .so has
-// zero link dependencies; all calls go through this function-pointer table.
+// This is the SINGLE ops table type used at every level from L3 to L6.
+// Follows the same pattern as simpler's PTO2RuntimeOps: the orchestration .so
+// has zero link dependencies; all calls go through this function-pointer table.
 //
-// The ops table is populated differently at each level:
-//   L0–L2: wraps simpler's PTO2OrchestratorState methods
-//   L3–L6: implemented by LinquOrchestratorState (same logic, parameterized)
+// The ops table is populated by LinquOrchestratorState (same logic at all levels).
+// L0–L2 use simpler's own PTO2RuntimeOps (separate codebase, not linked here).
 //
 typedef struct LinquRuntimeOps {
     // --- Core operations (present at every level) ---
 
-    // Submit a task to a target node. At L0–L2 this maps to simpler's
-    // pto2_submit_task; at L3–L6 it maps to LinquOrchestratorState::submit_task.
+    // Submit a task to a target node. Maps to LinquOrchestratorState::submit_task.
     void (*submit_task)(LinquRuntime* rt,
                         LinquCoordinate target,
                         const char* kernel_so,
                         LinquParam* params, int num_params);
 
-    // Scope management — same semantics as PTO2RuntimeOps::scope_begin/end
+    // Scope management
     void (*scope_begin)(LinquRuntime* rt);
     void (*scope_end)(LinquRuntime* rt);
 
@@ -328,7 +354,7 @@ typedef struct LinquRuntimeOps {
                              size_t size_bytes);
     void (*free_tensor)(LinquRuntime* rt, uint64_t handle);
 
-    // Orchestration completion — same as PTO2RuntimeOps::orchestration_done
+    // Orchestration completion
     void (*orchestration_done)(LinquRuntime* rt);
 
     // --- Extended operations (available at all levels, may be no-op at L0–L2) ---
@@ -350,7 +376,7 @@ typedef struct LinquRuntimeOps {
     // Profiling: dump ring buffer snapshot
     void (*dump_ring_snapshot)(LinquRuntime* rt, const char* label);
 
-    // Logging (mirrors PTO2RuntimeOps::log_info / log_error / etc.)
+    // Logging
     void (*log_error)(LinquRuntime* rt, const char* fmt, ...);
     void (*log_warn)(LinquRuntime* rt, const char* fmt, ...);
     void (*log_info)(LinquRuntime* rt, const char* fmt, ...);
@@ -362,14 +388,14 @@ typedef struct LinquRuntimeOps {
 } LinquRuntimeOps;
 
 // =============================================================================
-// LinquRuntime — Opaque runtime pointer (same pattern as PTO2Runtime)
+// LinquRuntime — Opaque runtime pointer
 // =============================================================================
 struct LinquRuntime {
     const LinquRuntimeOps* ops;   // first field (C struct layout guarantee)
 };
 
 // =============================================================================
-// LinquOrchConfig — replaces PTO2OrchestrationConfig with level tag
+// LinquOrchConfig — configuration returned by .so entry point
 // =============================================================================
 typedef struct LinquOrchConfig {
     uint8_t level;              // pl.Level value (0..6)
@@ -430,7 +456,7 @@ static inline void linqu_orchestration_done(LinquRuntime* rt) {
 }
 
 // =============================================================================
-// RAII Scope Guard and Macro (identical pattern to PTO2_SCOPE)
+// RAII Scope Guard and Macro
 // =============================================================================
 
 #ifdef __cplusplus
@@ -449,7 +475,7 @@ private:
 #endif
 
 // =============================================================================
-// Logging Macros (identical pattern to simpler's LOG_INFO etc.)
+// Logging Macros
 // =============================================================================
 
 #define LINQU_LOG_ERROR(rt, fmt, ...) (rt)->ops->log_error(rt, fmt, ##__VA_ARGS__)
@@ -462,7 +488,7 @@ private:
 
 ### `LinquOrchestratorState` — The Unified Runtime Implementation
 
-This is the **single C++ class** that implements the runtime for **all** levels. It directly mirrors `simpler`'s `PTO2OrchestratorState`:
+This is the **single C++ class** that implements the runtime for all levels (L3–L6):
 
 ```cpp
 // src/runtime/linqu_orchestrator_state.h
@@ -473,18 +499,18 @@ struct LinquOrchestratorState {
     Level level;                    // Which level this instance serves
     LinquCoordinate coord;          // This node's coordinate
 
-    // === RING BUFFERS (same design as PTO2HeapRing / PTO2TaskRing) ===
-    // Per-depth arrays, identical to simpler but parameterized per level
+    // === RING BUFFERS (LinquHeapRing / LinquTaskRing) ===
+    // Per-depth arrays, same algorithm at every level L3–L6
     LinquHeapRing    buffer_ring[MAX_SCOPE_DEPTH];
     LinquTaskRing    task_ring[MAX_SCOPE_DEPTH];
     LinquDepListPool dep_pool;
 
-    // === TENSOR MAP (same design as PTO2TensorMap) ===
+    // === TENSOR MAP (LinquTensorMap — handle-based exact match) ===
     // Local: hash table mapping tensor_handle → producer task_id
     // Extended: cross-node lookup for handles on remote nodes
     LinquTensorMap tensor_map;
 
-    // === SCOPE STACK (same design as simpler's scope_tasks/begins) ===
+    // === SCOPE STACK (LinquScopeStack) ===
     int32_t* scope_tasks;
     int32_t  scope_tasks_size;
     int32_t  scope_tasks_capacity;
@@ -493,20 +519,20 @@ struct LinquOrchestratorState {
     uint64_t scope_stack_capacity;
 
     // === DISPATCHER (level-dependent routing) ===
-    // L0–L2: wraps simpler's PTO2SchedulerState (via SimplerDispatcher)
-    // L3:    local execution or dispatch to simpler
+    // L3:    local execution or stub to L2 (future: ChipBackend adapter)
     // L4–L6: remote dispatch via IPC/network to child nodes
     LinquDispatcher* dispatcher;
 
-    // === TRANSPORT (level-dependent) ===
-    // L0–L2: shared memory (via simpler)
-    // L3–L6: Unix sockets (verification) or TCP/RDMA (production)
+    // === TRANSPORT (three-tier, level-dependent) ===
+    // Tier 1 (L0–L2): shared device GM with atomics (via simpler, not managed here)
+    // Tier 2 (L3↔L2): h2d_copy / d2h_copy DMA (managed by ChipBackend adapter)
+    // Tier 3 (L3–L6): Unix sockets (verification) or TCP/RDMA (production)
     LinquTransport* transport;
 
     // === PEER REGISTRY ===
     LinquPeerRegistry* peers;
 
-    // === STATISTICS (same as PTO2OrchestratorState) ===
+    // === STATISTICS ===
     int64_t tasks_submitted;
     int64_t buffers_allocated;
     int64_t bytes_allocated;
@@ -516,15 +542,16 @@ struct LinquOrchestratorState {
 };
 ```
 
-Key insight: `LinquHeapRing`, `LinquTaskRing`, `LinquDepListPool`, `LinquTensorMap` are **code-identical** to `PTO2HeapRing`, `PTO2TaskRing`, `PTO2DepListPool`, `PTO2TensorMap` — they use the same algorithms (O(1) bump allocation, ring wrap-around, lazy invalidation, chain truncation). The only difference is the backing store:
+Key insight: `LinquHeapRing`, `LinquTaskRing`, `LinquDepListPool`, `LinquTensorMap` use the **same core algorithms** as `simpler`'s equivalents (O(1) bump allocation, ring wrap-around, lazy invalidation, chain truncation) but are **independent re-implementations** in `pypto_runtime_distributed` — no code is shared or linked. The key differences are the backing store and synchronization model:
 
-| Component | L0–L2 (simpler) | L3–L6 (Linqu) |
-|-----------|-----------------|----------------|
-| HeapRing backing | Hardware GM Heap (shared memory) | `malloc`'d buffer or memory-mapped region |
-| TaskRing backing | Shared memory task descriptors | Local `std::vector<LinquTaskDescriptor>` |
-| DepListPool backing | Shared memory | Local allocation |
-| TensorMap | Local only | Local + cross-node lookup extension |
-| Scheduler | Hardware worker queues | Thread pool (L3) or IPC dispatch (L4–L6) |
+| Component | L0–L2 (simpler, Tier 1) | L3–L6 (Linqu, Tier 2/3) |
+|-----------|-------------------------|--------------------------|
+| HeapRing backing | Device GM (shared memory, atomics) | `malloc`'d host memory (local, mutex) |
+| TaskRing backing | Device GM task descriptors (LOAD_ACQUIRE/STORE_RELEASE) | Local `std::vector<LinquTaskDescriptor>` (mutex) |
+| DepListPool backing | Device GM (shared) | Local allocation (single-process) |
+| TensorMap key | GM buffer address (overlap detection) | Opaque integer handle (exact match) |
+| Scheduler | Device-side worker queues (atomics) | Message-driven: TASK_COMPLETE → on_task_complete |
+| L3↔L2 boundary | N/A (same address space) | `h2d_copy` / `d2h_copy` DMA via ChipBackend |
 
 ### How the Runtime Populates the Ops Table
 
@@ -534,29 +561,7 @@ When the daemon loads a `.so` and calls `linqu_orch_config()`, it gets the level
 2. Populates a `LinquRuntimeOps` struct with function pointers that call into the orchestrator state.
 3. Wraps it in a `LinquRuntime` and calls `linqu_orch_entry(rt, args, arg_count)`.
 
-For **L0–L2**, the ops table delegates to simpler:
-
-```cpp
-static LinquRuntimeOps make_simpler_adapter_ops() {
-    return LinquRuntimeOps{
-        .submit_task = [](LinquRuntime* rt, LinquCoordinate target,
-                          const char* kernel_so, LinquParam* params, int n) {
-            auto* state = get_state(rt);
-            // Convert LinquParam → PTOParam
-            // Call pto2_submit_task(state->simpler_orch, kernel_id, worker_type, pto_params, n)
-        },
-        .scope_begin = [](LinquRuntime* rt) {
-            pto2_scope_begin(get_state(rt)->simpler_orch);
-        },
-        .scope_end = [](LinquRuntime* rt) {
-            pto2_scope_end(get_state(rt)->simpler_orch);
-        },
-        // ... all ops delegate to PTO2OrchestratorState ...
-    };
-}
-```
-
-For **L3–L6**, the ops table delegates to `LinquOrchestratorState`:
+The ops table delegates to `LinquOrchestratorState` at all levels (L3–L6):
 
 ```cpp
 static LinquRuntimeOps make_linqu_ops() {
@@ -565,18 +570,12 @@ static LinquRuntimeOps make_linqu_ops() {
                           const char* kernel_so, LinquParam* params, int n) {
             auto* state = get_state(rt);
             linqu_orch_submit_task(state, target, kernel_so, params, n);
-            // internally: alloc from task_ring, lookup inputs in tensor_map,
-            // register outputs, add to scope_tasks — identical logic to
-            // pto2_submit_task
         },
         .scope_begin = [](LinquRuntime* rt) {
             linqu_orch_scope_begin(get_state(rt));
-            // identical to pto2_scope_begin: push scope_begins, increment top
         },
         .scope_end = [](LinquRuntime* rt) {
             linqu_orch_scope_end(get_state(rt));
-            // identical to pto2_scope_end: pop scope, increment fanout_refcount
-            // for each task, trigger retirement scan
         },
         // ... etc ...
     };
@@ -589,27 +588,30 @@ The implementation bodies (`linqu_orch_submit_task`, `linqu_orch_scope_begin`, e
 2. **How the dispatcher routes tasks**: local execution (L3) vs remote IPC (L4–L6).
 3. **Whether tensor map does cross-node lookup** (L4–L6) or only local lookup (L3).
 
-### L0–L2 `.so` Compatibility
+### L0–L2 Boundary: Future `ChipBackend` Adapter (Not Part of Phase 0)
 
-For **L0–L2 orchestration functions** already written using `simpler`'s API (`PTO2Runtime*`, `pto2_rt_submit_task`, `PTO2_SCOPE`), two options exist:
+L0–L2 execution is handled by `simpler`, a separate codebase (`pypto_workspace/simpler/`). In Phase 0, `pypto_runtime_distributed` does **NOT** link against or call into `simpler`. The L3 daemon's downward dispatch to L2 is **stubbed** — it simulates chip-level completion without actual device execution.
 
-**Option A — Native simpler execution:** The daemon recognizes `level ∈ {0,1,2}` from `linqu_orch_config()` and delegates the `.so` directly to `simpler`'s executor, which uses `PTO2Runtime*` natively. The `.so` never sees `LinquRuntime*`.
+In a future phase, a `ChipBackend` adapter will be implemented **within `pypto_runtime_distributed`** that:
+- Calls `simpler`'s `PTO2OrchestratorState` through a stable ABI (dynamic linking to `libhost_runtime.so`).
+- Manages `h2d_copy`/`d2h_copy` for host↔device data transfer.
+- Maps Linqu's opaque tensor handles to device GM addresses.
 
-**Option B — Unified wrapper:** New L0–L2 `.so` files use the unified `LinquRuntime*` API. The ops table wraps simpler's implementation. This requires new `.so` files to include `linqu_orchestration_api.h` instead of `pto_orchestration_api.h`.
+This adapter does NOT modify `simpler` — it calls `simpler`'s existing public API.
 
-For Phase 0, we use **Option A** for existing simpler orchestration code and **Option B** for new code. Both approaches are fully supported because the ops table pattern is the same.
+### Relationship Between simpler Components and Linqu Re-implementations (Reference)
 
-### Relationship Between simpler Components and Linqu Re-implementations
+The table below shows the correspondence between `simpler` and Linqu components. These are **independent re-implementations** — no code is shared or linked between the two projects.
 
-| simpler Component | Linqu Equivalent | Reuse Strategy |
-|-------------------|-----------------|----------------|
-| `PTO2HeapRing` | `LinquHeapRing` | **Same algorithm**, different backing store. Could be a template `RingBuffer<BackingStore>`. |
-| `PTO2TaskRing` | `LinquTaskRing` | **Same algorithm**, different task descriptor struct (Linqu adds coordinate, level). |
-| `PTO2DepListPool` | `LinquDepListPool` | **Same algorithm**, same structure. Direct copy. |
-| `PTO2TensorMap` | `LinquTensorMap` | **Same core** (hash + ring pool + lazy invalidation). Extended with remote lookup. |
-| `PTO2OrchestratorState` | `LinquOrchestratorState` | **Same orchestration logic** (scope stack, submit_task flow). Parameterized by level. |
-| `PTO2SchedulerState` | `LinquDispatcher` | Different: simpler dispatches to HW workers; Linqu dispatches to child nodes. |
-| `PTO2RuntimeOps` | `LinquRuntimeOps` | Superset: Linqu adds `query_peers`, `self_coord`, `reg_data`, `dump_ring_snapshot`. |
+| simpler Component (L0–L2, reference) | Linqu Equivalent (L3–L6, implemented) | Difference |
+|---------------------------------------|---------------------------------------|------------|
+| `PTO2HeapRing` | `LinquHeapRing` | Same algorithm, host memory backing (not device GM) |
+| `PTO2TaskRing` | `LinquTaskRing` | Same algorithm, extended descriptor (coordinate, level, fanin/fanout) |
+| `PTO2DepListPool` | `LinquDepListPool` | Same algorithm |
+| `PTO2TensorMap` (address-based overlap) | `LinquTensorMap` (handle-based exact match) | No overlap detection (unnecessary without shared buffer space) |
+| `PTO2OrchestratorState` | `LinquOrchestratorState` | Same orchestration logic, mutex instead of atomics |
+| `PTO2SchedulerState` (device-side, atomics) | Message-driven scheduler in `LinquOrchestratorState` | TASK_COMPLETE messages instead of shared-memory polling |
+| `PTO2RuntimeOps` | `LinquRuntimeOps` | Extended with `query_peers`, `self_coord`, `reg_data`, `dump_ring_snapshot` |
 
 ### PyPTO Compiler Output Convention
 
@@ -645,7 +647,7 @@ Inside `linqu_orch_entry`, the function uses ops table calls that work **identic
 | **Topology:** `topo_L5_supernode.so` | L5 | `query_peers(4)`, `submit_task` to L4 pods |
 | **Topology:** `topo_L4_pod.so` | L4 | `query_peers(3)`, `submit_task` to L3 hosts |
 | **Topology:** `topo_L3_host.so` | L3 | `self_coord`, `query_peers`, `log_info` |
-| **DAG:** `kernel_add.so` etc. | L0 | Pure C compute (via simpler), or unified API via Option B |
+| **DAG:** `kernel_add.so` etc. | L0 | Stubbed L0 compute (future: dispatched via ChipBackend to simpler) |
 | **DAG:** `dag_L4_pod.so` | L4 | `submit_task`, `alloc_tensor`, `LINQU_SCOPE`, `wait_all` |
 | **Ring:** `ring_phase1_L3_host.so` | L3 | `alloc_tensor`, `submit_task`, `LINQU_SCOPE`, `dump_ring_snapshot` |
 | **Ring:** `ring_phase2_L3_host.so` | L3 | `alloc_tensor`, `free_tensor`, `LINQU_SCOPE` |
@@ -654,10 +656,9 @@ Inside `linqu_orch_entry`, the function uses ops table calls that work **identic
 **Deliverable:**
 - `src/runtime/linqu_orchestration_api.h` — the unified ops table header (shown above)
 - `src/runtime/linqu_orchestrator_state.h/.cpp` — the unified runtime implementation
-- `src/runtime/linqu_simpler_adapter.h/.cpp` — ops table wrapper for simpler (L0–L2)
 - `docs/compiler_output_convention.md` — standalone reference
 
-**Acceptance:** An engineer can write a new test `.so` for any level L0–L6 by including only `linqu_orchestration_api.h` and calling the same ops table functions. The runtime transparently routes to the correct backend.
+**Acceptance:** An engineer can write a new test `.so` for any level L3–L6 by including only `linqu_orchestration_api.h` and calling the same ops table functions. The runtime transparently routes to the correct backend. No dependency on `simpler` headers or libraries.
 
 ---
 
@@ -764,15 +765,15 @@ Provide three implementations:
 
 ## Milestone 3: Ring Buffers — Components of `LinquOrchestratorState` (`src/ring/`)
 
-**Goal:** Implement `LinquHeapRing`, `LinquTaskRing`, and `LinquDepListPool` — the ring buffer subsystems that live inside `LinquOrchestratorState`. These are **the same algorithms** as `simpler`'s `PTO2HeapRing`, `PTO2TaskRing`, and `PTO2DepListPool`, adapted to work with local memory backing instead of hardware shared memory.
+**Goal:** Implement `LinquHeapRing`, `LinquTaskRing`, and `LinquDepListPool` — the ring buffer subsystems that live inside `LinquOrchestratorState`. These use the **same core algorithms** as `simpler`'s equivalents but are **independent re-implementations** adapted to work with local host memory instead of device shared memory. No `simpler` code is included or linked.
 
 ### Step 3.1: `LinquHeapRing` — Buffer Allocation Ring
 
-**Action:** Implement the heap ring buffer, mirroring `PTO2HeapRing`:
+**Action:** Implement the heap ring buffer (same algorithm as `simpler`'s `PTO2HeapRing`, independent implementation):
 
 ```cpp
-// Same O(1) bump allocation, wrap-around, back-pressure as PTO2HeapRing
-// Difference: backing store is malloc'd buffer, not GM Heap
+// O(1) bump allocation, wrap-around, back-pressure
+// Backing store: malloc'd host memory (not device GM)
 struct LinquHeapRing {
     void*    base;
     uint64_t size;
@@ -791,7 +792,7 @@ void  linqu_heap_ring_reset(LinquHeapRing* ring);
 
 ### Step 3.2: `LinquTaskRing` — Task Slot Ring
 
-**Action:** Implement the task ring, mirroring `PTO2TaskRing`:
+**Action:** Implement the task ring (same algorithm as `simpler`'s `PTO2TaskRing`, independent implementation):
 
 ```cpp
 struct LinquTaskDescriptor {
@@ -819,7 +820,7 @@ void    linqu_task_ring_reset(LinquTaskRing* ring);
 
 ### Step 3.3: `LinquDepListPool` — Dependency List Pool
 
-**Action:** Implement the dep list pool, mirroring `PTO2DepListPool`:
+**Action:** Implement the dep list pool (same algorithm as `simpler`'s `PTO2DepListPool`, independent implementation):
 
 ```cpp
 struct LinquDepListPool {
@@ -838,7 +839,7 @@ int32_t linqu_dep_list_prepend(LinquDepListPool* pool, int32_t head, int32_t tas
 **Action:** Each `LinquOrchestratorState` holds per-depth arrays of rings:
 
 ```cpp
-static constexpr int MAX_SCOPE_DEPTH = 8;  // same as PTO2_MAX_SCOPE_DEPTH
+static constexpr int MAX_SCOPE_DEPTH = 8;
 
 // Inside LinquOrchestratorState:
 LinquTaskRing    task_ring[MAX_SCOPE_DEPTH];
@@ -853,11 +854,11 @@ LinquHeapRing    buffer_ring[MAX_SCOPE_DEPTH];
 
 ## Milestone 4: Scope Stack and TensorMap — Components of `LinquOrchestratorState`
 
-**Goal:** Implement the scope stack and tensor map subsystems that live inside `LinquOrchestratorState`. These mirror `simpler`'s scope management (embedded in `PTO2OrchestratorState`) and `PTO2TensorMap`.
+**Goal:** Implement the scope stack and tensor map subsystems that live inside `LinquOrchestratorState`. These use the same core logic as `simpler`'s scope management and `PTO2TensorMap` but are independent re-implementations.
 
 ### Step 4.1: Scope Stack
 
-**Action:** Implement the scope stack, mirroring `simpler`'s `scope_tasks` / `scope_begins` / `scope_stack_top`:
+**Action:** Implement the scope stack:
 
 ```cpp
 // Inside LinquOrchestratorState:
@@ -870,7 +871,7 @@ int32_t  scope_stack_top;      // -1 = no scope open
 
 Functions:
 - `linqu_scope_begin(state)` — push new scope: `scope_begins[++top] = scope_tasks_size`.
-- `linqu_scope_end(state)` — pop scope: iterate `scope_tasks[scope_begins[top]..size)`, for each task apply scope-exit token (same logic as `pto2_scope_end`).
+- `linqu_scope_end(state)` — pop scope: iterate `scope_tasks[scope_begins[top]..size)`, for each task apply scope-exit token.
 
 **Deliverable:** `src/runtime/linqu_scope.h/.cpp`, unit tests.
 
@@ -880,7 +881,7 @@ Functions:
 - If `task_freed == true` → skip (pl.free already applied).
 - Else → `ref_count += 1` (scope token). If `ref_count == fanout_count` → task is reclaimable.
 
-This is **identical** to `pto2_scope_end`'s logic.
+This is the standard scope-exit logic: iterate tasks, apply retirement tokens, trigger ring pointer advancement.
 
 **Deliverable:** Part of `linqu_scope_end`, unit tests.
 
@@ -895,10 +896,10 @@ This is **identical** to `pto2_scope_end`'s logic.
 
 ### Step 4.4: `LinquTensorMap` — Local + Cross-Node Extension
 
-**Action:** Implement the tensor map, mirroring `PTO2TensorMap`:
+**Action:** Implement the tensor map:
 
 ```cpp
-// Core: same hash-table + ring-buffer entry pool as PTO2TensorMap
+// Hash-table + ring-buffer entry pool for handle→producer mapping
 struct LinquTensorMap {
     int32_t*              buckets;
     int32_t               num_buckets;
@@ -915,18 +916,18 @@ struct LinquTensorMap {
 };
 ```
 
-**Functions** (same API as `PTO2TensorMap`):
-- `linqu_tensormap_insert(tm, handle, task_id, with_alloc)` — identical to `pto2_tensormap_insert`.
+**Functions:**
+- `linqu_tensormap_insert(tm, handle, task_id, with_alloc)` — insert handle→producer mapping, with per-task chain linking and INOUT optimization.
 - `linqu_tensormap_lookup(tm, handle, result)` — local lookup first; if miss AND `transport != NULL`, broadcast `TENSOR_LOOKUP` to peers.
-- `linqu_tensormap_cleanup_retired(tm, old, new)` — identical to `pto2_tensormap_cleanup_retired`.
+- `linqu_tensormap_cleanup_retired(tm, old, new)` — invalidate entries for retired tasks.
 
 **Deliverable:** `src/runtime/linqu_tensormap.h/.cpp`, unit tests.
 
 ---
 
-## Milestone 5: Simpler Adapter and Dispatcher — Level-Dependent Routing
+## Milestone 5: Dispatcher — Level-Dependent Routing
 
-**Goal:** Implement the level-dependent parts of `LinquOrchestratorState`: the dispatcher that routes tasks to the correct execution backend, and the simpler adapter for L0–L2.
+**Goal:** Implement the level-dependent parts of `LinquOrchestratorState`: the dispatcher that routes tasks to the correct execution backend.
 
 ### Step 5.1: `LinquDispatcher` Interface
 
@@ -946,26 +947,16 @@ public:
 
 **Deliverable:** `src/runtime/linqu_dispatcher.h`.
 
-### Step 5.2: `SimplerDispatcher` — L0–L2 Backend
+### Step 5.2: `LocalDispatcher` — L3 Host Backend
 
-**Action:** Implements dispatch to `simpler`:
-- `dlopen()`s the orchestration `.so`, resolves entry points.
-- Creates a `PTO2OrchestratorState`, populates a `PTO2Runtime*`, calls the entry.
-- Internally, `simpler` manages its own ring buffers, scope stack, and tensor map.
-
-This is the adapter that wraps simpler's complete `PTO2OrchestratorState` behind the `LinquDispatcher` interface.
-
-**Deliverable:** `src/runtime/simpler_dispatcher.h/.cpp`.
-
-### Step 5.3: `LocalDispatcher` — L3 Host Backend
-
-**Action:** Dispatches tasks to a local thread pool or executes them synchronously:
-- For L0 kernels: delegates to `SimplerDispatcher`.
-- For other work: runs in a worker thread on the same host.
+**Action:** Dispatches tasks locally on the same host:
+- `dlopen()`s the kernel `.so`, resolves entry points, and executes synchronously or via a worker thread.
+- For L3→L2 dispatch (chip-level tasks), uses a **stub** in Phase 0 that simulates task completion without actual device execution. The stub records the dispatch, simulates a configurable latency, and returns completion status.
+- In a future phase, the `ChipBackend` adapter (see Step 5.5) replaces the stub for actual device dispatch.
 
 **Deliverable:** `src/runtime/local_dispatcher.h/.cpp`.
 
-### Step 5.4: `RemoteDispatcher` — L4–L6 Network Backend
+### Step 5.3: `RemoteDispatcher` — L4–L6 Network Backend
 
 **Action:** Dispatches tasks to child nodes via IPC/network:
 - Serializes the task (kernel `.so` name, params, target coordinate).
@@ -974,13 +965,28 @@ This is the adapter that wraps simpler's complete `PTO2OrchestratorState` behind
 
 **Deliverable:** `src/runtime/remote_dispatcher.h/.cpp`.
 
-### Step 5.5: `MockDispatcher` — Testing Backend
+### Step 5.4: `MockDispatcher` — Testing Backend
 
 **Action:** Simulates task execution for unit testing:
 - `dispatch()` → records the call, optionally sleeps, marks complete.
 - Configurable latency and failure modes.
 
 **Deliverable:** `src/runtime/mock_dispatcher.h`.
+
+### Step 5.5: `ChipBackend` Adapter — L3→L2 Bridge (Future Phase, Design Only in Phase 0)
+
+**Action (Phase 0):** Document the `ChipBackend` adapter interface — the Tier 2 bridge between Linqu's host memory (L3) and `simpler`'s device GM (L0–L2). No implementation in Phase 0; the `LocalDispatcher` uses a stub instead.
+
+**Future implementation responsibilities (NOT in Phase 0):**
+- Dynamic linking to `simpler`'s `libhost_runtime.so` (via `dlopen`, no compile-time dependency).
+- `h2d_copy`: transfer input tensors from host memory to device GM before chip-level task submission.
+- `d2h_copy`: transfer output tensors from device GM back to host memory after chip-level completion.
+- Handle→device GM address mapping table.
+- Device GM buffer lifecycle management (allocate on `h2d_copy`, release on scope retirement).
+
+**Key constraint:** The adapter calls `simpler`'s existing public API through a stable ABI. It does NOT modify `simpler` source code. It lives entirely within `pypto_runtime_distributed`.
+
+**Deliverable (Phase 0):** `docs/chip_backend_adapter_spec.md` — interface specification for the future adapter.
 
 ---
 
@@ -1103,7 +1109,7 @@ class NodeDaemon {
     NodeIdentity identity;
     Transport& transport;
     PeerRegistry registry;
-    LinquDispatcher* dispatcher;  // SimplerDispatcher for L0–2, RemoteDispatcher for L4–6
+    LinquDispatcher* dispatcher;  // LocalDispatcher for L3, RemoteDispatcher for L4–6
     CodeCache code_cache;         // blob_hash → .so file path
     DataCache data_cache;         // data_handle → buffer pointer
 
@@ -1184,7 +1190,7 @@ void NodeDaemon::handle_message(const LinquHeader& hdr, const uint8_t* payload) 
                 send_retry_with_code(hdr.sender_coord, task.blob_hash);
                 break;
             }
-            // Execute via dispatcher (SimplerDispatcher for L0–2, RemoteDispatcher for L4–6)
+            // Execute via dispatcher (LocalDispatcher for L3, RemoteDispatcher for L4–6)
             execute_task(task, so_path);
             send_task_complete(hdr.sender_coord, task.task_key);
             break;
@@ -1209,7 +1215,7 @@ int main(int argc, char** argv) {
     auto coord = read_coordinates_from_env();
     auto storage = create_storage_dir(coord);
     auto transport = UnixSocketTransport(storage + "/daemon.sock");
-    auto dispatcher = SimplerDispatcher();  // or MockDispatcher for testing
+    auto dispatcher = LocalDispatcher();  // or MockDispatcher for testing
     NodeDaemon daemon(coord, transport, &dispatcher, storage);
     daemon.run();
 }
@@ -1231,15 +1237,15 @@ int main(int argc, char** argv) {
 
 **Deliverable:** `src/dispatch/dispatcher.h`.
 
-### Step 9.2: Level 0–2 Dispatch (Delegate to `simpler`)
+### Step 9.2: Level 0–2 Dispatch (Stubbed in Phase 0)
 
-**Action:** For `Level ∈ {0, 1, 2}`, delegate to `SimplerDispatcher`.
+**Action:** For `Level ∈ {0, 1, 2}`, the `LocalDispatcher` uses a **stub** that simulates chip-level task completion. In a future phase, the `ChipBackend` adapter will replace the stub for actual device dispatch via `simpler`'s ABI (without modifying `simpler`).
 
 **Deliverable:** Add to `Dispatcher`, unit test with `MockDispatcher`.
 
-### Step 9.3: Level 3 Dispatch (Host-Level Multi-Chip)
+### Step 9.3: Level 3 Dispatch (Host-Level)
 
-**Action:** Implement host-level dispatch: fan out to multiple chips on the same host via `SimplerDispatcher`.
+**Action:** Implement host-level dispatch via `LocalDispatcher`: local kernel execution and stub dispatch to L2.
 
 **Deliverable:** Add to `Dispatcher`, unit test.
 
@@ -2990,8 +2996,8 @@ This validates the full message protocol over Unix sockets without any actual co
 ### Step 15.1: README.md
 
 **Action:** Write a project README covering:
-- What the project is (Linqu runtime for Level 2–6).
-- Relationship to `simpler` (adapter, do not modify).
+- What the project is (Linqu runtime for Level 3–6, self-contained).
+- Relationship to `simpler` (separate codebase for L0–2, not modified or linked; future `ChipBackend` adapter for Tier 2 integration).
 - The verification environment (multi-process on single arm64 machine).
 - How to build and run the hierarchical test.
 - Architecture overview (link to design doc).
@@ -3000,8 +3006,8 @@ This validates the full message protocol over Unix sockets without any actual co
 
 **Action:** Write `docs/api_reference.md` documenting:
 - `linqu_orchestration_api.h` — for writing orchestration `.so` files at L3–L6.
-- `LinquOrchestratorState` — unified runtime for all levels.
-- `LinquDispatcher` / `SimplerDispatcher` — level-dependent dispatch.
+- `LinquOrchestratorState` — unified runtime for all levels (L3–L6).
+- `LinquDispatcher` / `LocalDispatcher` / `RemoteDispatcher` — level-dependent dispatch.
 - `NodeDaemon` — process management.
 - `Transport` — IPC/network abstraction.
 
@@ -3032,8 +3038,7 @@ This validates the full message protocol over Unix sockets without any actual co
 | `LinquTensorMap` | Tensor→producer map — same core as `PTO2TensorMap` + cross-node lookup extension | Complete |
 | Scope stack | `scope_tasks[]`, `scope_begins[]`, `scope_stack_top` — same as simpler | Complete |
 | **Level-Dependent Dispatchers** | | |
-| `SimplerDispatcher` | L0–L2: wraps `PTO2OrchestratorState` behind `LinquDispatcher` interface | Complete |
-| `LocalDispatcher` | L3: local execution, delegates L0 kernels to simpler | Complete |
+| `LocalDispatcher` | L3: local execution, stub to L2 (future: ChipBackend adapter) | Complete |
 | `RemoteDispatcher` | L4–L6: sends tasks to child nodes via IPC/network | Complete |
 | `MockDispatcher` | Testing: simulates execution with configurable latency | Complete |
 | **Communication** | | |
@@ -3056,14 +3061,14 @@ This validates the full message protocol over Unix sockets without any actual co
 | `topo_L3_host.so` | L3 kernel: `self_coord` + `query_peers` + `log_info` | Complete |
 | `verify_topology.sh` | 8-check automated verification of 1024-node cluster | Complete |
 | **Test Program 2: Distributed DAG (L0+L4+L5+L6 kernel stack)** | | |
-| `kernel_add.so`, `kernel_add_scalar.so`, `kernel_mul.so` | L0 kernels: dispatched via `SimplerDispatcher` | Complete |
+| `kernel_add.so`, `kernel_add_scalar.so`, `kernel_mul.so` | L0 kernels: stubbed dispatch in Phase 0 | Complete |
 | `dag_L4_pod.so` | L4 kernel: 5-task DAG `(a+b+1)(a+b+2)+(a+b)` across 4 hosts | Complete |
 | `dag_L5_supernode.so`, `dag_L6_cluster.so` | L5/L6 kernels: hierarchical dispatch for cluster-scale DAG | Complete |
 | `LinquTensorMap` cross-node | Remote lookup + data transfer for cross-node dependencies | Complete |
 | `verify_dag.sh` | 6-check: numerical, transfers, deps, scopes, lifetime, completeness | Complete |
 | Per-task execution trace | `task_trace.json` per node: inputs, producers, transfers, scopes | Complete |
 | **Test Program 3: Ring Stress (L0+L3+L4+L5+L6 kernel stack)** | | |
-| `kernel_noop.so` | L0 kernel: sentinel-writing no-op dispatched via `SimplerDispatcher` | Complete |
+| `kernel_noop.so` | L0 kernel: sentinel-writing no-op (stubbed dispatch in Phase 0) | Complete |
 | `ring_phase1_L3_host.so`, `ring_phase2_L3_host.so` | L3 kernels: fill/retire and nested scopes with pl.free() | Complete |
 | `ring_phase3_L4_pod.so` | L4 kernel: pod ring + dispatches L3 kernels | Complete |
 | `ring_phase4_L6/L5/L4.so` | L6/L5/L4 kernels: 4-level nested ring allocation | Complete |
@@ -3080,10 +3085,28 @@ This validates the full message protocol over Unix sockets without any actual co
 
 | Phase | Trigger | Key Work |
 |-------|---------|----------|
-| **Phase 1** | Multi-die chips ship | Update `SimplerDispatcher` for L1; verify L1 flows through all code paths. |
+| **Phase 1** | `simpler` integration ready + chip hardware available | **Tier 2 bridge implementation:** Implement the `ChipBackend` adapter within `pypto_runtime_distributed` that dynamically links to `simpler`'s `libhost_runtime.so` (via `dlopen`, no compile-time dependency). Implement `h2d_copy`/`d2h_copy`; handle→device GM address mapping; device GM buffer lifecycle management. Does NOT modify `simpler`. |
 | **Phase 2** | Multi-host pod hardware ready | Replace `UnixSocketTransport` with TCP sockets; activate gossip (UDP heartbeat, SWIM); real SPMD fan-out. |
 | **Phase 3** | Supernode hardware ready | Activate L5 rings; hierarchical dispatch (L5 leaders); aggregation nodes. |
 | **Phase 4** | Full cluster hardware ready | Activate L6 rings; bandwidth-aware scheduling; RDMA optimization. |
 | **Phase 5** | Production deployment | Full profiling; CI gating; stress tests; compatibility adapters. |
 
 Detailed implementation plans for Phases 1–5 will be written when their hardware triggers are met.
+
+---
+
+## Appendix: Three-Tier Communication Model Reference
+
+This appendix summarizes the three-tier communication architecture that governs all cross-level data flow in the Linqu system. See `linqu_runtime_design.md` §7.4 for the full specification.
+
+| Tier | Levels | Memory Model | Transport | Sync Mechanism | Managed By |
+|------|--------|-------------|-----------|----------------|------------|
+| **1** | L0–L2 (intra-chip) | Shared device GM | Direct pointer access | `__atomic` CAS, LOAD_ACQUIRE/STORE_RELEASE | `simpler` (separate codebase, not modified or linked) |
+| **2** | L3↔L2 (host↔device) | Host mem ↔ Device GM | `h2d_copy` / `d2h_copy` DMA | DMA completion events, MMIO | Future `ChipBackend` adapter (in `pypto_runtime_distributed`) |
+| **3** | L4–L6↔L3 (inter-process) | Independent address spaces | Unix socket / TCP / RDMA | Message ACK (TASK_COMPLETE) | `RemoteDispatcher` + `NodeDaemon` |
+
+Key design decisions driven by this model:
+- `LinquTensorMap` uses opaque handles (not GM addresses) because L3–L6 have no shared buffer space.
+- `LinquOrchestratorState` uses `std::mutex` (not atomics) because all state is process-local.
+- Back-pressure is message-driven (spin on `TASK_COMPLETE` arrivals), not shared-memory-driven.
+- The `NodeDaemon` at L3 is the bridge between Tier 3 (messages from L4+) and Tier 2 (DMA to L2).

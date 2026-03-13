@@ -32,15 +32,6 @@ if(PROFILING_SRC)
     add_library(linqu_profiling STATIC ${PROFILING_SRC})
 endif()
 
-# Runtime library (orchestrator state, dispatchers)
-file(GLOB RUNTIME_SRC src/runtime/*.cpp)
-if(RUNTIME_SRC)
-    add_library(linqu_runtime_lib STATIC ${RUNTIME_SRC})
-    if(PROFILING_SRC)
-        target_link_libraries(linqu_runtime_lib linqu_profiling)
-    endif()
-endif()
-
 # Transport library
 file(GLOB TRANSPORT_SRC src/transport/*.cpp)
 if(TRANSPORT_SRC)
@@ -51,6 +42,19 @@ endif()
 file(GLOB DISCOVERY_SRC src/discovery/*.cpp)
 if(DISCOVERY_SRC)
     add_library(linqu_discovery STATIC ${DISCOVERY_SRC})
+endif()
+
+# Runtime library (orchestrator state, dispatchers)
+file(GLOB RUNTIME_SRC src/runtime/*.cpp)
+if(RUNTIME_SRC)
+    add_library(linqu_runtime_lib STATIC ${RUNTIME_SRC})
+    if(PROFILING_SRC)
+        target_link_libraries(linqu_runtime_lib linqu_profiling)
+    endif()
+    if(DISCOVERY_SRC AND TRANSPORT_SRC)
+        target_link_libraries(linqu_runtime_lib linqu_discovery linqu_transport)
+    endif()
+    target_link_libraries(linqu_runtime_lib dl)
 endif()
 
 # Daemon library (exclude main.cpp and orchestrator_main.cpp from the library)
@@ -94,17 +98,17 @@ linqu_add_test(test_orchestration_api tests/unit/test_orchestration_api.cpp)
 linqu_add_test(test_ring_buffers tests/unit/test_ring_buffers.cpp linqu_ring)
 
 # ---- Milestone 4: Scope + TensorMap tests ----
-linqu_add_test(test_scope_tensormap tests/unit/test_scope_tensormap.cpp linqu_runtime_lib linqu_ring)
+linqu_add_test(test_scope_tensormap tests/unit/test_scope_tensormap.cpp linqu_runtime_lib linqu_ring linqu_discovery linqu_transport)
 
 # ---- Milestone 4B: OrchestratorState integration test ----
-linqu_add_test(test_orchestrator_state tests/unit/test_orchestrator_state.cpp linqu_runtime_lib linqu_ring)
+linqu_add_test(test_orchestrator_state tests/unit/test_orchestrator_state.cpp linqu_runtime_lib linqu_ring linqu_discovery linqu_transport)
 
 # ---- Milestone 6: Transport + Process isolation test ----
 if(TRANSPORT_SRC)
     linqu_add_test(test_process_isolation tests/unit/test_process_isolation.cpp linqu_transport)
     linqu_add_test(test_multilevel_chain tests/unit/test_multilevel_chain.cpp linqu_transport)
     linqu_add_test(test_fanout_isolation tests/unit/test_fanout_isolation.cpp linqu_transport)
-    linqu_add_test(test_dispatchers tests/unit/test_dispatchers.cpp linqu_runtime_lib linqu_ring linqu_transport)
+    linqu_add_test(test_dispatchers tests/unit/test_dispatchers.cpp linqu_runtime_lib linqu_ring linqu_transport linqu_discovery)
 endif()
 
 # ---- Milestone 7: Discovery tests ----
@@ -120,6 +124,48 @@ if(DAEMON_SRC)
     linqu_add_test(test_dag tests/unit/test_dag.cpp linqu_daemon_lib)
     linqu_add_test(test_ring_stress tests/unit/test_ring_stress.cpp linqu_daemon_lib)
     linqu_add_test(test_storage tests/unit/test_storage.cpp linqu_daemon_lib)
-    linqu_add_test(test_profiling tests/unit/test_profiling.cpp linqu_runtime_lib linqu_ring linqu_profiling)
+    linqu_add_test(test_profiling tests/unit/test_profiling.cpp linqu_runtime_lib linqu_ring linqu_profiling linqu_discovery linqu_transport)
     linqu_add_test(test_forward_compat tests/unit/test_forward_compat.cpp linqu_daemon_lib)
+    linqu_add_test(test_completion_wiring tests/unit/test_completion_wiring.cpp linqu_daemon_lib)
+    linqu_add_test(test_scheduler tests/unit/test_scheduler.cpp linqu_daemon_lib)
+    linqu_add_test(test_ring_retirement tests/unit/test_ring_retirement.cpp linqu_daemon_lib)
+    linqu_add_test(test_backpressure tests/unit/test_backpressure.cpp linqu_daemon_lib)
+    linqu_add_test(test_query_peers tests/unit/test_query_peers.cpp linqu_daemon_lib)
+    linqu_add_test(test_param_passing tests/unit/test_param_passing.cpp linqu_daemon_lib)
+    linqu_add_test(test_tensormap_enhanced tests/unit/test_tensormap_enhanced.cpp linqu_runtime_lib linqu_ring linqu_discovery linqu_transport)
 endif()
+
+# ---- Forward Compatibility tests ----
+if(DISCOVERY_SRC AND TRANSPORT_SRC)
+    linqu_add_test(test_peer_registry_multi_level tests/forward_compat/test_peer_registry_multi_level.cpp linqu_discovery linqu_transport)
+    linqu_add_test(test_7_level_smoke tests/forward_compat/test_7_level_smoke.cpp linqu_transport)
+endif()
+
+# ---- Kernel shared libraries (for verification tests) ----
+set(KERNEL_LINK_FLAGS "-shared -fPIC")
+
+macro(linqu_add_kernel KERNEL_NAME KERNEL_SRC)
+    add_library(${KERNEL_NAME} SHARED ${KERNEL_SRC})
+    set_target_properties(${KERNEL_NAME} PROPERTIES
+        PREFIX ""
+        SUFFIX ".so"
+        POSITION_INDEPENDENT_CODE ON
+    )
+endmacro()
+
+# Topology kernels
+linqu_add_kernel(topo_L3_host examples/topology_test/kernels/topo_L3_host.cpp)
+linqu_add_kernel(topo_L4_pod examples/topology_test/kernels/topo_L4_pod.cpp)
+linqu_add_kernel(topo_L5_clos1 examples/topology_test/kernels/topo_L5_clos1.cpp)
+linqu_add_kernel(topo_L6_clos2 examples/topology_test/kernels/topo_L6_clos2.cpp)
+
+# DAG kernels
+linqu_add_kernel(dag_L3_compute examples/tensor_dag_test/kernels/dag_L3_compute.cpp)
+linqu_add_kernel(dag_L4_dispatch examples/tensor_dag_test/kernels/dag_L4_dispatch.cpp)
+linqu_add_kernel(dag_L5_dispatch examples/tensor_dag_test/kernels/dag_L5_dispatch.cpp)
+linqu_add_kernel(dag_L6_dispatch examples/tensor_dag_test/kernels/dag_L6_dispatch.cpp)
+
+# Ring stress kernels
+linqu_add_kernel(ring_L3_stress examples/ring_stress_test/kernels/ring_L3_stress.cpp)
+linqu_add_kernel(ring_L4_stress examples/ring_stress_test/kernels/ring_L4_stress.cpp)
+linqu_add_kernel(ring_L5_stress examples/ring_stress_test/kernels/ring_L5_stress.cpp)

@@ -8,6 +8,7 @@
 #include "discovery/peer_registry.h"
 #include "discovery/filesystem_discovery.h"
 #include "daemon/code_cache.h"
+#include "daemon/data_cache.h"
 #include "runtime/linqu_orchestrator_state.h"
 #include "profiling/ring_metrics.h"
 #include <atomic>
@@ -35,6 +36,7 @@ public:
     const std::string& storage_path() const { return storage_path_; }
     PeerRegistry& peer_registry() { return registry_; }
     CodeCache& code_cache() { return code_cache_; }
+    DataCache& data_cache() { return data_cache_; }
 
     int messages_handled() const { return messages_handled_; }
     bool is_running() const { return running_.load(); }
@@ -42,6 +44,10 @@ public:
 private:
     void handle_call_task(const LinquHeader& hdr, const std::vector<uint8_t>& payload);
     void handle_shutdown(const LinquHeader& hdr, const std::vector<uint8_t>& payload);
+    void handle_reg_code(const LinquHeader& hdr, const std::vector<uint8_t>& payload);
+    void handle_reg_data(const LinquHeader& hdr, const std::vector<uint8_t>& payload);
+    void handle_scope_exit(const LinquHeader& hdr, const std::vector<uint8_t>& payload);
+    void handle_heartbeat(const LinquHeader& hdr, const std::vector<uint8_t>& payload);
 
     void send_task_complete(const LinquCoordinate& sender_coord,
                             uint8_t sender_level,
@@ -55,6 +61,7 @@ private:
     UnixSocketTransport transport_;
     PeerRegistry registry_;
     CodeCache code_cache_;
+    DataCache data_cache_;
 
     std::atomic<bool> running_{false};
     int messages_handled_ = 0;

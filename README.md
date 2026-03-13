@@ -1,6 +1,6 @@
 # Linqu Distributed Runtime
 
-Linqu is a hierarchical distributed runtime for Levels 2–6 of the PyPTO machine hierarchy. It extends the `simpler` runtime (which handles Levels 0–2: Core, Chip Die, Chip) upward through Host (L3), Pod (L4), CLOS1/Supernode (L5), and CLOS2/Cluster (L6).
+Linqu is a self-contained hierarchical distributed runtime for Levels 3–6 of the PyPTO machine hierarchy. It does NOT link against or modify the `simpler` runtime (which handles Levels 0–2). Integration between Linqu (L3+) and `simpler` (L0–L2) will be achieved via a future `ChipBackend` adapter; in Phase 0, L3→L2 dispatch is stubbed.
 
 ## Architecture
 
@@ -10,12 +10,20 @@ Linqu follows a **single-process orchestration** model: one orchestration proces
 L6 (CLOS2)  ──► 16 L5 processes
   L5 (CLOS1)  ──► 4 L4 processes
     L4 (POD)    ──► 16 L3 processes
-      L3 (HOST)   ──► simpler runtime (L0–L2)
+      L3 (HOST)   ──► stub dispatch to L2 (future: ChipBackend → simpler)
+```
+
+### Three-Tier Communication Model
+
+```
+Tier 3: Message Passing (L4–L6 ↔ L3) — Unix Socket / TCP / RDMA
+Tier 2: Host-Device DMA (L3 ↔ L2)    — h2d_copy / d2h_copy (future)
+Tier 1: Shared Device GM (L0–L2)      — atomics + barriers (simpler, not linked)
 ```
 
 ### Unified Runtime API
 
-All levels share the same `LinquRuntimeOps` function-pointer table, mirroring `simpler`'s `PTO2RuntimeOps`. Every `.so` kernel uses the same API regardless of which level it runs at:
+All levels share the same `LinquRuntimeOps` function-pointer table. Every `.so` kernel uses the same API regardless of which level it runs at:
 
 - `submit_task` — dispatch a kernel to a target node
 - `scope_begin` / `scope_end` — RAII scope management
@@ -25,7 +33,7 @@ All levels share the same `LinquRuntimeOps` function-pointer table, mirroring `s
 
 ## Relationship to `simpler`
 
-Linqu is an **adapter** on top of simpler. It does not modify simpler's code. At the L3 boundary, `SimplerDispatcher` wraps `PTO2OrchestratorState` behind the `LinquDispatcher` interface. Upper levels (L4–L6) use `RemoteDispatcher` for cross-process task submission.
+`simpler` is a **separate, immutable codebase** (`pypto_workspace/simpler/`) that handles Levels 0–2. This project (`pypto_runtime_distributed`) does NOT link against `simpler`, does NOT include `simpler` headers, and does NOT call any `simpler` API. The two runtimes are completely independent. A future `ChipBackend` adapter (within this project) will bridge the L3↔L2 boundary via dynamic linking (`dlopen`) and `h2d_copy`/`d2h_copy` DMA — without modifying `simpler`.
 
 ## Building
 
@@ -49,53 +57,32 @@ Requires: C++17, aarch64 (arm64), CMake ≥ 3.16.
 cd build && ctest --output-on-failure -j4
 ```
 
-18 unit tests covering: core identity, ring buffers, scope/tensormap, orchestrator state, process isolation (vertical and horizontal), dispatchers, discovery, daemon, dispatch engine, topology, DAG computation, ring stress, storage, profiling, and forward compatibility.
+25+ unit tests covering: core identity, ring buffers, scope/tensormap, orchestrator state, process isolation, dispatchers, discovery, daemon, dispatch engine, topology, DAG computation, ring stress, storage, profiling, forward compatibility, completion wiring, scheduler, ring retirement, back-pressure, query peers, param passing, and enhanced tensormap.
 
 ### E2E Tests
 
 ```bash
-# Single daemon lifecycle
-tests/e2e/test_single_daemon.sh
-
-# 16-host pod
-tests/e2e/test_single_pod.sh
-
-# 64-host supernode (4 pods × 16 hosts)
-tests/e2e/test_single_supernode.sh
-
-# IPC roundtrip validation
-tests/e2e/test_ipc_roundtrip.sh
-
-# Orchestrator discover + shutdown
-tests/e2e/test_orchestrator.sh
-
-# Node failure resilience
-tests/e2e/test_node_failure.sh
+tests/e2e/test_single_daemon.sh      # Single daemon lifecycle
+tests/e2e/test_single_pod.sh         # 16-host pod
+tests/e2e/test_single_supernode.sh   # 64-host supernode
+tests/e2e/test_ipc_roundtrip.sh      # IPC roundtrip validation
+tests/e2e/test_orchestrator.sh       # Orchestrator discover + shutdown
+tests/e2e/test_node_failure.sh       # Node failure resilience
 ```
 
 ### 1024-Node Virtual Cluster
 
 ```bash
-# Create directory topology
 ./venv/create_topology.sh --verify
-
-# Launch 1024 daemon processes
 ./venv/launch_cluster.sh
-
-# Check cluster health
 ./venv/cluster_status.sh
-
-# Orchestrator operations
 ./build/linqu_orchestrator --command discover
-./build/linqu_orchestrator --command shutdown
-
-# Clean shutdown
 ./venv/shutdown_cluster.sh
 ```
 
 ## Verification Environment
 
-The verification environment runs multiple daemon processes on a single arm64 machine. Each level runs in a separate OS process, communicating via Unix domain sockets. Storage is filesystem-based, with each node having its own directory:
+Each hierarchy node runs as a separate OS process on the same arm64 machine:
 
 ```
 /tmp/linqu/<cluster>/L6_0/L5_<s>/L4_<p>/L3_<h>/
@@ -110,7 +97,7 @@ The verification environment runs multiple daemon processes on a single arm64 ma
 ## Test Programs
 
 ### 1. Topology Test
-Each L3 daemon writes `identity.json` with its coordinate and PID, verifying the hierarchical structure is correct.
+Each level dispatches to the level below. L3 daemons write `identity.json` with coordinates and PID. Verification checks hierarchical structure correctness across all 1024 nodes.
 
 ### 2. Distributed DAG Test
 Computes `f[i] = (a[i]+b[i]+1)(a[i]+b[i]+2) + (a[i]+b[i])` across distributed nodes using `LinquTensorMap` for cross-node data dependencies.
@@ -122,25 +109,25 @@ Exercises ring buffers with nested scopes, early `pl.free()`, and controlled all
 
 ```
 src/
-├── core/           # Level enum, LinquCoordinate, TaskKey
+├── core/           # Level enum, LinquCoordinate, TaskKey, NodeIdentity
 ├── ring/           # LinquHeapRing, LinquTaskRing, LinquDepListPool
 ├── runtime/        # LinquOrchestratorState, dispatchers, API header
 ├── transport/      # LinquHeader, msg_types, UnixSocketTransport
 ├── discovery/      # PeerRegistry, FilesystemDiscovery
-├── daemon/         # NodeDaemon, CodeCache, Storage, main executables
+├── daemon/         # NodeDaemon, CodeCache, DataCache, Storage
 └── profiling/      # RingMetrics, ProfileReport
 tests/
-├── unit/           # 18 unit tests
-└── e2e/            # 6 end-to-end shell tests
+├── unit/           # 25+ unit tests
+├── forward_compat/ # Mock 7-level topology tests
+└── e2e/            # End-to-end shell tests
 examples/
-├── topology_test/  # L3 identity kernel
-├── tensor_dag_test/# Distributed DAG kernels
-└── ring_stress_test/# Ring buffer stress kernels
+├── topology_test/  # L3-L6 topology kernels + verification
+├── tensor_dag_test/# L0-L6 distributed DAG kernels + verification
+└── ring_stress_test/# Ring buffer stress kernels + verification
 venv/               # 1024-node cluster launch scripts
-docs/               # Implementation plan
+docs/               # Implementation plan, API contract, adapter spec
 ```
 
 ## Design References
 
 - [Linqu Runtime Design](../pypto_top_level_design_documents/linqu_runtime_design.md)
-- [Machine Hierarchy](../pypto_top_level_design_documents/machine_hierarchy_and_function_hierarchy.md)

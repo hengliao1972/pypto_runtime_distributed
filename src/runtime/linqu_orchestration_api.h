@@ -78,15 +78,12 @@ typedef struct LinquPeerList {
 typedef struct LinquRuntime LinquRuntime;
 
 /* ====================================================================
- * LinquRuntimeOps — unified ops table for ALL levels (L0–L6)
+ * LinquRuntimeOps — unified ops table for L3–L6
  *
- * Mirrors PTO2RuntimeOps. The orchestration .so has zero link deps;
- * all calls go through this function-pointer table.
- *
- * At L0–L2 the runtime wraps simpler's implementation behind these
- * same function pointers. At L3–L6 LinquOrchestratorState provides
- * the implementation. The orchestration function cannot tell the
- * difference.
+ * The orchestration .so has zero link deps; all calls go through
+ * this function-pointer table. LinquOrchestratorState provides the
+ * implementation at every level. L0–L2 are handled by a separate
+ * codebase (simpler) — not linked or modified by this project.
  * ==================================================================== */
 typedef struct LinquRuntimeOps {
     void (*submit_task)(LinquRuntime* rt,
@@ -125,7 +122,7 @@ typedef struct LinquRuntimeOps {
 } LinquRuntimeOps;
 
 /* ====================================================================
- * LinquRuntime — opaque runtime pointer (same pattern as PTO2Runtime)
+ * LinquRuntime — opaque runtime pointer
  * ==================================================================== */
 struct LinquRuntime {
     const LinquRuntimeOps* ops;

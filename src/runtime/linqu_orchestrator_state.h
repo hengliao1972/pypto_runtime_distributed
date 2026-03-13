@@ -11,9 +11,12 @@
 #include "runtime/linqu_orchestration_api.h"
 #include "runtime/linqu_dispatcher.h"
 #include "profiling/ring_metrics.h"
+#include "discovery/peer_registry.h"
+#include "discovery/filesystem_discovery.h"
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <mutex>
 #include <functional>
 
 namespace linqu {
@@ -54,10 +57,20 @@ public:
     LinquRuntime* runtime() { return &rt_; }
 
     void set_dispatch_fn(TaskDispatchFn fn) { dispatch_fn_ = std::move(fn); }
-    void set_dispatcher(LinquDispatcher* d) { dispatcher_ = d; }
+    void set_dispatcher(LinquDispatcher* d);
+
+    void set_peer_registry(PeerRegistry* reg) { peer_registry_ = reg; }
+    void set_filesystem_discovery(FilesystemDiscovery* disc) { fs_discovery_ = disc; }
+    PeerRegistry* peer_registry_ptr() const { return peer_registry_; }
+    FilesystemDiscovery* fs_discovery_ptr() const { return fs_discovery_; }
+
+    void on_task_complete(int32_t task_id);
+    void on_scope_release(int32_t task_id);
+    void try_advance_ring_pointers();
 
     LinquTaskRing& task_ring() { return task_ring_; }
     LinquHeapRing& heap_ring() { return heap_ring_; }
+    LinquDepListPool& dep_pool() { return dep_pool_; }
     LinquTensorMap& tensor_map() { return tensor_map_; }
     LinquScopeStack& scope_stack() { return scope_stack_; }
 
@@ -71,6 +84,10 @@ public:
 
 private:
     static LinquTaskDescriptor* scope_get_desc(int32_t tid, void* ctx);
+    void wire_dispatcher_callback();
+    void propagate_completion(int32_t task_id);
+    void check_consumers_ready(int32_t producer_task_id);
+    void check_task_consumed(int32_t task_id);
 
     Level level_ = Level::HOST;
     LinquCoordinate coord_;
@@ -86,6 +103,10 @@ private:
 
     TaskDispatchFn dispatch_fn_;
     LinquDispatcher* dispatcher_ = nullptr;
+    PeerRegistry* peer_registry_ = nullptr;
+    FilesystemDiscovery* fs_discovery_ = nullptr;
+
+    std::mutex scheduler_mu_;
 
     int64_t tasks_submitted_ = 0;
     uint64_t next_tensor_handle_ = 1;
@@ -94,6 +115,9 @@ private:
     size_t scope_begin_count_ = 0;
     size_t scope_end_count_ = 0;
     size_t free_tensor_count_ = 0;
+    size_t task_retire_count_ = 0;
+    size_t task_block_count_ = 0;
+    size_t heap_block_count_ = 0;
     size_t peak_task_used_ = 0;
     size_t peak_heap_used_ = 0;
     std::vector<RingSnapshot> snapshots_;

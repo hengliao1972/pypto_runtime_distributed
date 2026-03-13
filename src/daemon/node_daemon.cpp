@@ -93,9 +93,19 @@ bool NodeDaemon::handle_one_message(int timeout_ms) {
             handle_shutdown(hdr, payload);
             return true;
         case MsgType::HEARTBEAT:
+            handle_heartbeat(hdr, payload);
+            return true;
+        case MsgType::REG_CODE:
+            handle_reg_code(hdr, payload);
+            return true;
+        case MsgType::REG_DATA:
+            handle_reg_data(hdr, payload);
+            return true;
+        case MsgType::SCOPE_EXIT:
+            handle_scope_exit(hdr, payload);
             return true;
         default:
-            fprintf(stderr, "[Daemon L%d] Unknown msg_type=%d\n",
+            fprintf(stderr, "[Daemon L%d] Unhandled msg_type=%d\n",
                     level_value(level_), static_cast<int>(hdr.msg_type));
             return true;
     }
@@ -104,17 +114,55 @@ bool NodeDaemon::handle_one_message(int timeout_ms) {
 void NodeDaemon::handle_call_task(const LinquHeader& hdr,
                                    const std::vector<uint8_t>& payload) {
     auto task = CallTaskPayload::deserialize(payload.data(), payload.size());
-    fprintf(stderr, "[Daemon L%d %s] CALL_TASK: kernel=%s task_id=%u\n",
+    fprintf(stderr, "[Daemon L%d %s] CALL_TASK: kernel=%s task_id=%u num_params=%u\n",
             level_value(level_), coord_.to_string().c_str(),
-            task.kernel_so_name.c_str(), task.task_id);
+            task.kernel_so_name.c_str(), task.task_id, task.num_params);
+
+    std::vector<uint64_t> args;
+    std::vector<LinquParam> linqu_params;
+    args.reserve(task.params.size());
+    linqu_params.reserve(task.params.size());
+    for (const auto& pe : task.params) {
+        LinquParam lp;
+        lp.type = static_cast<LinquParamType>(pe.type);
+        lp.handle = pe.handle;
+        lp.scalar_value = pe.scalar_value;
+        linqu_params.push_back(lp);
+
+        if (lp.type == LINQU_PARAM_SCALAR) {
+            args.push_back(lp.scalar_value);
+        } else {
+            args.push_back(lp.handle);
+        }
+    }
 
     auto kernel = code_cache_.load(task.kernel_so_name);
+    int32_t status = 0;
+
     if (kernel.entry_fn) {
         LinquOrchestratorState state;
         LinquOrchConfig_Internal cfg;
         state.init(level_, coord_, cfg);
+        state.set_peer_registry(&registry_);
 
-        kernel.entry_fn(state.runtime(), nullptr, 0);
+        LinquCoordinate_C self_c;
+        self_c.l6_idx = coord_.l6_idx;
+        self_c.l5_idx = coord_.l5_idx;
+        self_c.l4_idx = coord_.l4_idx;
+        self_c.l3_idx = coord_.l3_idx;
+        self_c.l2_idx = coord_.l2_idx;
+        self_c.l1_idx = coord_.l1_idx;
+        self_c.l0_idx = coord_.l0_idx;
+
+        for (const auto& lp : linqu_params) {
+            if (lp.type == LINQU_PARAM_INPUT || lp.type == LINQU_PARAM_INOUT ||
+                lp.type == LINQU_PARAM_OUTPUT) {
+                state.alloc_tensor(self_c, 0);
+            }
+        }
+
+        kernel.entry_fn(state.runtime(), args.data(),
+                        static_cast<int>(args.size()));
 
         auto profile = state.generate_profile(coord_.to_string());
         task_profiles_.push_back(profile);
@@ -126,7 +174,7 @@ void NodeDaemon::handle_call_task(const LinquHeader& hdr,
     }
 
     send_task_complete(hdr.get_sender(), hdr.sender_level,
-                       task.task_id, 0);
+                       task.task_id, status);
 }
 
 void NodeDaemon::handle_shutdown(const LinquHeader&,
@@ -192,6 +240,55 @@ void NodeDaemon::write_profile_json() {
     fprintf(stderr, "[Daemon L%d %s] Wrote profile to %s (%zu tasks)\n",
             level_value(level_), coord_.to_string().c_str(),
             path.c_str(), task_profiles_.size());
+}
+
+void NodeDaemon::handle_reg_code(const LinquHeader&,
+                                  const std::vector<uint8_t>& payload) {
+    auto reg = RegCodePayload::deserialize(payload.data(), payload.size());
+    fprintf(stderr, "[Daemon L%d %s] REG_CODE: hash=0x%lx size=%zu\n",
+            level_value(level_), coord_.to_string().c_str(),
+            static_cast<unsigned long>(reg.blob_hash), reg.code_binary.size());
+
+    if (!reg.code_binary.empty()) {
+        std::string name = "blob_" + std::to_string(reg.blob_hash) + ".so";
+        code_cache_.register_code(name, reg.code_binary.data(), reg.code_binary.size());
+    }
+}
+
+void NodeDaemon::handle_reg_data(const LinquHeader&,
+                                  const std::vector<uint8_t>& payload) {
+    auto reg = RegDataPayload::deserialize(payload.data(), payload.size());
+    fprintf(stderr, "[Daemon L%d %s] REG_DATA: handle=0x%lx depth=%u size=%zu\n",
+            level_value(level_), coord_.to_string().c_str(),
+            static_cast<unsigned long>(reg.data_handle),
+            reg.scope_depth, reg.buffer_bytes.size());
+
+    if (!reg.buffer_bytes.empty()) {
+        data_cache_.register_data(reg.data_handle,
+                                   reg.buffer_bytes.data(),
+                                   reg.buffer_bytes.size());
+    }
+}
+
+void NodeDaemon::handle_scope_exit(const LinquHeader&,
+                                    const std::vector<uint8_t>& payload) {
+    auto se = ScopeExitPayload::deserialize(payload.data(), payload.size());
+    fprintf(stderr, "[Daemon L%d %s] SCOPE_EXIT: depth=%u\n",
+            level_value(level_), coord_.to_string().c_str(),
+            se.scope_depth);
+}
+
+void NodeDaemon::handle_heartbeat(const LinquHeader&,
+                                   const std::vector<uint8_t>& payload) {
+    auto hb = HeartbeatPayload::deserialize(payload.data(), payload.size());
+    PeerInfo info;
+    info.coord.l6_idx = hb.sender_l6;
+    info.coord.l5_idx = hb.sender_l5;
+    info.coord.l4_idx = hb.sender_l4;
+    info.coord.l3_idx = hb.sender_l3;
+    info.level = level_value(level_);
+    info.alive = (hb.status == 0);
+    registry_.add(info);
 }
 
 }

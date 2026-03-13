@@ -31,8 +31,8 @@ static void test_scope_basic() {
     ss.scope_end(get_desc, nullptr);
     assert(ss.depth() == -1);
 
-    assert(g_task_ring.get(t0)->ref_count == 1);
-    assert(g_task_ring.get(t1)->ref_count == 1);
+    assert(g_task_ring.get(t0)->fanout_refcount == 1);
+    assert(g_task_ring.get(t1)->fanout_refcount == 1);
 
     printf("  scope_basic: PASS\n");
 }
@@ -56,15 +56,15 @@ static void test_scope_nested() {
 
     ss.scope_end(get_desc, nullptr);  // exit depth 1
     assert(ss.depth() == 0);
-    assert(g_task_ring.get(inner0)->ref_count == 1);
-    assert(g_task_ring.get(inner1)->ref_count == 1);
-    assert(g_task_ring.get(outer0)->ref_count == 0);
-    assert(g_task_ring.get(outer1)->ref_count == 0);
+    assert(g_task_ring.get(inner0)->fanout_refcount == 1);
+    assert(g_task_ring.get(inner1)->fanout_refcount == 1);
+    assert(g_task_ring.get(outer0)->fanout_refcount == 0);
+    assert(g_task_ring.get(outer1)->fanout_refcount == 0);
 
     ss.scope_end(get_desc, nullptr);  // exit depth 0
     assert(ss.depth() == -1);
-    assert(g_task_ring.get(outer0)->ref_count == 1);
-    assert(g_task_ring.get(outer1)->ref_count == 1);
+    assert(g_task_ring.get(outer0)->fanout_refcount == 1);
+    assert(g_task_ring.get(outer1)->fanout_refcount == 1);
 
     printf("  scope_nested: PASS\n");
 }
@@ -81,12 +81,12 @@ static void test_scope_pl_free() {
     ss.add_task(t1);
 
     g_task_ring.get(t0)->task_freed = true;
-    g_task_ring.get(t0)->ref_count = 1;  // pl.free applied token
+    g_task_ring.get(t0)->fanout_refcount = 1;  // pl.free applied token
 
     ss.scope_end(get_desc, nullptr);
 
-    assert(g_task_ring.get(t0)->ref_count == 1);  // NOT incremented (skipped)
-    assert(g_task_ring.get(t1)->ref_count == 1);   // incremented
+    assert(g_task_ring.get(t0)->fanout_refcount == 1);  // NOT incremented (skipped)
+    assert(g_task_ring.get(t1)->fanout_refcount == 1);   // incremented
 
     printf("  scope_pl_free: PASS\n");
 }

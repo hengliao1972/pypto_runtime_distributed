@@ -103,9 +103,6 @@ static void test_dag_with_deps() {
     };
     linqu_submit_task(rt, target, "mul.so", p3, 3);
 
-    linqu_scope_end(rt);
-    linqu_scope_end(rt);
-
     assert(state.tasks_submitted() == 4);
 
     auto r = state.tensor_map().lookup(h_f);
@@ -113,6 +110,9 @@ static void test_dag_with_deps() {
 
     auto r_c = state.tensor_map().lookup(h_c);
     assert(r_c.found && r_c.producer_task_id == 0);
+
+    linqu_scope_end(rt);
+    linqu_scope_end(rt);
 
     linqu_orchestration_done(rt);
 

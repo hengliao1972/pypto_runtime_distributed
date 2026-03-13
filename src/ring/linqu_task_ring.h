@@ -10,15 +10,21 @@ namespace linqu {
 
 struct LinquTaskDescriptor {
     TaskKey key;
-    uint32_t fanout_count = 1;
-    uint32_t ref_count = 0;
+
+    uint32_t fanout_count = 1;     // 1 (scope) + N (consumer tasks)
+    uint32_t fanout_refcount = 0;  // incremented by scope_end + consumer completion
+    uint32_t fanin_count = 0;      // number of producer dependencies
+    uint32_t fanin_refcount = 0;   // incremented when producers complete
+
     bool task_freed = false;
-    int32_t dep_list_head = -1;
+    int32_t dep_list_head = -1;    // linked list of producers (fanin list)
+    int32_t fanout_list_head = -1; // linked list of consumers (fanout list)
     std::string kernel_so;
     size_t output_offset = 0;
     size_t output_size = 0;
+    size_t heap_end = 0;
 
-    enum class Status : uint8_t { PENDING, RUNNING, COMPLETED };
+    enum class Status : uint8_t { PENDING, READY, RUNNING, COMPLETED, CONSUMED };
     Status status = Status::PENDING;
 };
 
