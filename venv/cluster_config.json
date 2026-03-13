@@ -1,0 +1,62 @@
+{
+    "system_name": "linqu_vcluster_1024",
+    "description": "1024-node virtual cluster: 16 CLOS1 supernodes × 4 PODs × 16 hosts",
+    "topology": {
+        "L6_count": 1,
+        "L5_per_L6": 16,
+        "L4_per_L5": 4,
+        "L3_per_L4": 16,
+        "L2_per_L3": 1,
+        "L0_per_L2": 1,
+        "total_hosts": 1024
+    },
+    "level_names": {
+        "L6": "CLOS2 (Cluster-level-2, cross-rack)",
+        "L5": "CLOS1 (Cluster-level-1, supernode, 64 hosts)",
+        "L4": "POD  (Cluster-level-0, server group, 16 hosts)",
+        "L3": "HOST (single OS instance)",
+        "L2": "CHIP (mock, 1 per host)",
+        "L1": "CHIP_DIE (omitted)",
+        "L0": "CORE_GROUP (mock)"
+    },
+    "coordinate_ranges": {
+        "l6_idx": {"min": 0, "max": 0},
+        "l5_idx": {"min": 0, "max": 15},
+        "l4_idx": {"min": 0, "max": 3},
+        "l3_idx": {"min": 0, "max": 15}
+    },
+    "global_index_formula": "global = l5 * 64 + l4 * 16 + l3",
+    "ip_mapping": "10.<l5>.<l4>.<l3>",
+    "base_dir": "/tmp/linqu/linqu_vcluster_1024",
+    "socket_path_template": "<base>/L6_0/L5_<l5>/L4_<l4>/L3_<l3>/daemon.sock",
+    "environment_variables": {
+        "LINQU_SYSTEM": "linqu_vcluster_1024",
+        "LINQU_BASE": "/tmp/linqu/linqu_vcluster_1024",
+        "LINQU_L6": "0",
+        "LINQU_L5": "<supernode index 0..15>",
+        "LINQU_L4": "<pod index 0..3>",
+        "LINQU_L3": "<host index 0..15>",
+        "LINQU_USE_MOCK_CHIP": "1"
+    },
+    "resource_estimates": {
+        "per_process_virtual_memory_mb": 10,
+        "per_process_rss_mb": 2,
+        "per_process_fd_count": 10,
+        "total_virtual_memory_gb": 10,
+        "total_rss_gb": 2,
+        "total_fd_count": 10240,
+        "total_socket_files": 1024,
+        "total_threads": 2048,
+        "recommended_ulimit_n": 65536,
+        "recommended_ulimit_u": 8192,
+        "recommended_ram_gb": 16,
+        "recommended_tmp_space_gb": 1
+    },
+    "bandwidth_model": {
+        "L0_L2_intra_chip": "unlimited (same process memory)",
+        "L2_L3_chip_to_host": "unlimited (same process)",
+        "L3_L4_intra_pod": "10 Gbps simulated (Unix socket, no throttle)",
+        "L4_L5_intra_supernode": "10 Gbps simulated",
+        "L5_L6_cross_rack": "1 Gbps simulated (can add tc qdisc for realism)"
+    }
+}
