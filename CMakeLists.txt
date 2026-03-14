@@ -123,6 +123,8 @@ if(DAEMON_SRC)
     linqu_add_test(test_topology tests/unit/test_topology.cpp linqu_daemon_lib)
     linqu_add_test(test_dag tests/unit/test_dag.cpp linqu_daemon_lib)
     linqu_add_test(test_ring_stress tests/unit/test_ring_stress.cpp linqu_daemon_lib)
+    linqu_add_test(test_dfs_sum_hierarchy tests/unit/test_dfs_sum_hierarchy.cpp)
+    linqu_add_test(test_dfs_sum_multiprocess tests/unit/test_dfs_sum_multiprocess.cpp linqu_daemon_lib)
     linqu_add_test(test_storage tests/unit/test_storage.cpp linqu_daemon_lib)
     linqu_add_test(test_profiling tests/unit/test_profiling.cpp linqu_runtime_lib linqu_ring linqu_profiling linqu_discovery linqu_transport)
     linqu_add_test(test_forward_compat tests/unit/test_forward_compat.cpp linqu_daemon_lib)
@@ -169,3 +171,6 @@ linqu_add_kernel(dag_L6_dispatch examples/tensor_dag_test/kernels/dag_L6_dispatc
 linqu_add_kernel(ring_L3_stress examples/ring_stress_test/kernels/ring_L3_stress.cpp)
 linqu_add_kernel(ring_L4_stress examples/ring_stress_test/kernels/ring_L4_stress.cpp)
 linqu_add_kernel(ring_L5_stress examples/ring_stress_test/kernels/ring_L5_stress.cpp)
+
+# DFS sum kernels
+linqu_add_kernel(dfs_L3_reader examples/dfs_sum_test/kernels/dfs_L3_reader.cpp)

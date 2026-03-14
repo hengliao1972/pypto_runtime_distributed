@@ -104,7 +104,7 @@ static std::vector<pid_t> parse_trace(const std::vector<uint8_t>& data) {
 
 static int run_leaf_l3(const LevelSpec& spec, const LevelSpec& parent) {
     linqu::UnixSocketTransport transport(TEST_BASE, spec.coord, spec.level);
-    assert(transport.start_listening());
+    { bool _ok = transport.start_listening(); if (!_ok) { fprintf(stderr, "[FATAL] transport start_listening failed\n"); return 1; } }
     fprintf(stderr, "[L%d pid=%d] Listening at %s\n",
             spec.level, getpid(), transport.socket_path().c_str());
 
@@ -141,7 +141,7 @@ static int run_intermediate(const LevelSpec& spec, const LevelSpec& parent,
 static int run_intermediate(const LevelSpec& spec, const LevelSpec& parent,
                             const LevelSpec& child_spec, bool is_root) {
     linqu::UnixSocketTransport transport(TEST_BASE, spec.coord, spec.level);
-    assert(transport.start_listening());
+    { bool _ok = transport.start_listening(); if (!_ok) { fprintf(stderr, "[FATAL] transport start_listening failed\n"); return 1; } }
     fprintf(stderr, "[L%d pid=%d] Listening at %s\n",
             spec.level, getpid(), transport.socket_path().c_str());
 

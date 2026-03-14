@@ -45,7 +45,7 @@ static std::string build_test_kernel() {
         f << "#include <fstream>\n";
         f << "#include <unistd.h>\n";
         f << "extern \"C\" {\n";
-        f << "struct LinquOrchConfig { uint8_t level; int expected_arg_count; };\n";
+        f << "struct LinquOrchConfig { uint8_t level; int expected_arg_count; uint8_t role; };\n";
         f << "struct LinquRuntimeOps;\n";
         f << "struct LinquRuntime { const LinquRuntimeOps* ops; };\n";
         f << "__attribute__((visibility(\"default\")))\n";
@@ -117,7 +117,7 @@ int main() {
 
     // 3. Parent: set up L4 transport + RemoteDispatcher
     linqu::UnixSocketTransport l4_transport(TEST_BASE, l4_coord, 4);
-    assert(l4_transport.start_listening());
+    { bool _ok = l4_transport.start_listening(); if (!_ok) { fprintf(stderr, "[FATAL] L4 start_listening failed\n"); return 1; } }
 
     linqu::RemoteDispatcher dispatcher(l4_transport, l4_coord, 4);
     dispatcher.start_recv_loop();

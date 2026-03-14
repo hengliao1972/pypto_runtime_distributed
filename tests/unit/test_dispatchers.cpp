@@ -189,7 +189,7 @@ static void test_remote_dispatcher() {
     }
 
     linqu::UnixSocketTransport l4_transport(TEST_BASE, l4_coord, 4);
-    assert(l4_transport.start_listening());
+    if (!l4_transport.start_listening()) { fprintf(stderr, "[FATAL] start_listening failed\n"); abort(); }
     usleep(500000);
 
     linqu::RemoteDispatcher remote(l4_transport, l4_coord, 4);

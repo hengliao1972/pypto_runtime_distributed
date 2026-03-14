@@ -129,11 +129,25 @@ struct LinquRuntime {
 };
 
 /* ====================================================================
+ * LinquFunctionRole — role of a .so function (orchestrator or worker)
+ *   LINQU_ROLE_ORCHESTRATOR (0, default): builds/submits DAG tasks, manages
+ *       ring/tensor allocation.  Compatible with all pre-role kernels that
+ *       return LinquOrchConfig without an explicit role field.
+ *   LINQU_ROLE_WORKER (1): executes concrete task payload; may dispatch to
+ *       a lower-level orchestrator via runtime RPC.
+ * ==================================================================== */
+typedef enum {
+    LINQU_ROLE_ORCHESTRATOR = 0,
+    LINQU_ROLE_WORKER       = 1,
+} LinquFunctionRole;
+
+/* ====================================================================
  * LinquOrchConfig — every .so exports this via linqu_orch_config()
  * ==================================================================== */
 typedef struct LinquOrchConfig {
     uint8_t level;
-    int expected_arg_count;
+    int     expected_arg_count;
+    uint8_t role;  /* LinquFunctionRole — default 0 = ORCHESTRATOR */
 } LinquOrchConfig;
 
 /* ====================================================================

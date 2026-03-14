@@ -39,7 +39,7 @@ static void test_code_cache() {
         std::ofstream f(src_path);
         f << "#include <cstdint>\n";
         f << "extern \"C\" {\n";
-        f << "struct LinquOrchConfig { uint8_t level; int expected_arg_count; };\n";
+        f << "struct LinquOrchConfig { uint8_t level; int expected_arg_count; uint8_t role; };\n";
         f << "struct LinquRuntime { const void* ops; };\n";
         f << "__attribute__((visibility(\"default\")))\n";
         f << "LinquOrchConfig linqu_orch_config(uint64_t*, int) {\n";
@@ -143,7 +143,7 @@ static void test_daemon_message_handling() {
 
     // Parent listens for TASK_COMPLETE
     linqu::UnixSocketTransport parent_transport(TEST_BASE, l4_coord, 4);
-    assert(parent_transport.start_listening());
+    if (!parent_transport.start_listening()) { fprintf(stderr, "[FATAL] start_listening failed\n"); abort(); }
     usleep(500000);
 
     // Send CALL_TASK
@@ -160,18 +160,25 @@ static void test_daemon_message_handling() {
 
     std::string daemon_sock = linqu::UnixSocketTransport::make_socket_path(
         TEST_BASE, l3_coord, 3);
-    assert(send_raw(daemon_sock, hdr, buf.data(), buf.size()));
+    if (!send_raw(daemon_sock, hdr, buf.data(), buf.size())) {
+        fprintf(stderr, "[FATAL] send CALL_TASK failed\n"); abort();
+    }
     fprintf(stderr, "[parent] Sent CALL_TASK\n");
 
     // Receive TASK_COMPLETE
     linqu::LinquHeader resp;
     std::vector<uint8_t> resp_payload;
-    assert(parent_transport.recv(resp, resp_payload, 10000));
-    assert(resp.msg_type == linqu::MsgType::TASK_COMPLETE);
+    if (!parent_transport.recv(resp, resp_payload, 10000)) {
+        fprintf(stderr, "[FATAL] recv TASK_COMPLETE failed\n"); abort();
+    }
+    if (resp.msg_type != linqu::MsgType::TASK_COMPLETE) {
+        fprintf(stderr, "[FATAL] unexpected msg_type\n"); abort();
+    }
     auto comp = linqu::TaskCompletePayload::deserialize(
         resp_payload.data(), resp_payload.size());
-    assert(comp.task_id == 77);
-    assert(comp.status == 0);
+    if (comp.task_id != 77 || comp.status != 0) {
+        fprintf(stderr, "[FATAL] bad task_id or status\n"); abort();
+    }
     fprintf(stderr, "[parent] Got TASK_COMPLETE for task_id=%u [PASS]\n",
             comp.task_id);
 
@@ -182,7 +189,9 @@ static void test_daemon_message_handling() {
         linqu::MsgType::SHUTDOWN,
         4, l4_coord, l3_coord,
         static_cast<uint32_t>(shut_buf.size()));
-    assert(send_raw(daemon_sock, shut_hdr, shut_buf.data(), shut_buf.size()));
+    if (!send_raw(daemon_sock, shut_hdr, shut_buf.data(), shut_buf.size())) {
+        fprintf(stderr, "[FATAL] send SHUTDOWN failed\n"); abort();
+    }
 
     int wstatus;
     waitpid(child, &wstatus, 0);

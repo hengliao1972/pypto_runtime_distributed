@@ -103,7 +103,7 @@ int main() {
     usleep(600000);
 
     linqu::UnixSocketTransport l4_transport(TEST_BASE, l4_coord, 4);
-    assert(l4_transport.start_listening());
+    { bool _ok = l4_transport.start_listening(); if (!_ok) { fprintf(stderr, "[FATAL] L4 start_listening failed\n"); return 1; } }
 
     linqu::RemoteDispatcher dispatcher(l4_transport, l4_coord, 4);
     dispatcher.start_recv_loop();

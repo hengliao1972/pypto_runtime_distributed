@@ -42,6 +42,12 @@ The **single header** included by every `.so` kernel at any level. Pure C API wi
 ### `LinquOrchConfig`
 Every `.so` exports `linqu_orch_config()` returning: `level` (uint8_t), `expected_arg_count` (int).
 
+### Function role model (`orchestrator` / `worker`)
+- Grammar-level extension: `@pl.function(..., role=...)` and `pl.at(..., role=...)`.
+- `orchestrator`: submits tasks and manages DAG/ring ownership.
+- `worker`: executes concrete task payload and can dispatch lower-level orchestrators via runtime APIs.
+- ABI note: current exported `LinquOrchConfig` stays unchanged for compatibility.
+
 ### `LINQU_SCOPE(rt)`
 RAII scope guard macro. Usage: `LINQU_SCOPE(rt) { ... }` — automatically calls `scope_begin`/`scope_end`.
 

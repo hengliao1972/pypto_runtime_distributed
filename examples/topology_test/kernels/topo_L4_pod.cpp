@@ -8,7 +8,7 @@
 
 extern "C" {
 
-struct LinquOrchConfig { uint8_t level; int expected_arg_count; };
+struct LinquOrchConfig { uint8_t level; int expected_arg_count; uint8_t role; };
 struct LinquCoordinate_C {
     uint8_t l6_idx; uint8_t l5_idx; uint8_t l4_idx;
     uint16_t l3_idx; uint16_t l2_idx; uint8_t l1_idx; uint16_t l0_idx;

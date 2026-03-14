@@ -23,6 +23,17 @@ Returns a `LinquOrchConfig` struct:
 - `level` — the hierarchy level this function runs at (3=HOST, 4=POD, 5=CLOS1, 6=CLOS2)
 - `expected_arg_count` — number of arguments expected
 
+### Role annotation (`orchestrator` vs `worker`)
+
+Source-level grammar supports a function role concept:
+- `@pl.function(..., role=pl.Role.ORCHESTRATOR | pl.Role.WORKER)`
+- `pl.at(..., role=pl.Role.ORCHESTRATOR | pl.Role.WORKER)`
+
+Current ABI remains unchanged (`LinquOrchConfig` still exports `level` + `expected_arg_count`).
+Role is treated as compiler/runtime semantic metadata:
+- `ORCHESTRATOR` functions build/submit DAG tasks.
+- `WORKER` functions execute concrete tasks and may invoke lower-level orchestrators through runtime dispatch.
+
 ### `linqu_orch_entry`
 The actual orchestration function. Receives:
 - `rt` — opaque runtime pointer; all operations go through `rt->ops->...`

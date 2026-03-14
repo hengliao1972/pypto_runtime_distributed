@@ -90,7 +90,7 @@ static void test_filesystem_discovery() {
     auto make_transport = [&](linqu::LinquCoordinate coord, uint8_t level)
         -> linqu::UnixSocketTransport* {
         auto* t = new linqu::UnixSocketTransport(TEST_BASE, coord, level);
-        assert(t->start_listening());
+        if (!t->start_listening()) { fprintf(stderr, "[FATAL] start_listening failed\n"); abort(); }
         transports.push_back(t);
         return t;
     };
@@ -166,7 +166,7 @@ static void test_multi_pod_discovery() {
         linqu::LinquCoordinate l4c;
         l4c.l5_idx = 0; l4c.l4_idx = static_cast<uint8_t>(pod);
         auto* t = new linqu::UnixSocketTransport(TEST_BASE, l4c, 4);
-        assert(t->start_listening());
+        if (!t->start_listening()) { fprintf(stderr, "[FATAL] start_listening failed\n"); abort(); }
         transports.push_back(t);
 
         for (int h = 0; h < 3; h++) {
@@ -175,7 +175,7 @@ static void test_multi_pod_discovery() {
             l3c.l4_idx = static_cast<uint8_t>(pod);
             l3c.l3_idx = static_cast<uint16_t>(h);
             auto* t2 = new linqu::UnixSocketTransport(TEST_BASE, l3c, 3);
-            assert(t2->start_listening());
+            if (!t2->start_listening()) { fprintf(stderr, "[FATAL] start_listening failed\n"); abort(); }
             transports.push_back(t2);
         }
     }

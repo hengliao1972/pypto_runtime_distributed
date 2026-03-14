@@ -144,7 +144,7 @@ int main() {
     l4_coord.l4_idx = 0;
 
     linqu::UnixSocketTransport l4_transport(TEST_BASE, l4_coord, 4);
-    assert(l4_transport.start_listening());
+    { bool _ok = l4_transport.start_listening(); if (!_ok) { fprintf(stderr, "[FATAL] L4 start_listening failed\n"); return 1; } }
     fprintf(stderr, "[L4 pid=%d] Listening at %s\n",
             getpid(), l4_transport.socket_path().c_str());
 
