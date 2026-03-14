@@ -1,11 +1,18 @@
 """
 test_dfs_sum_hierarchy_pl_function.py — DFS Hierarchical Sum Test (pl.function style)
 
-PyPTO equivalent of test_dfs_sum_hierarchy.cpp using the @pl.function(level=..., role=...)
-decorator grammar for worker functions. The L7→L3 hierarchical orchestration is expressed
-as a single nested structure of parallel loops with pl.at(role=ORCHESTRATOR) blocks at each
-level. Worker functions are @pl.function-decorated named definitions, referenced from
-within the nested loops.
+PyPTO equivalent of test_dfs_sum_hierarchy.cpp using ONLY the
+@pl.function(level=..., role=...) decorator grammar.  Each C++ function maps
+to a @pl.function-decorated Python function:
+
+    C++ function              →  Python @pl.function
+    ─────────────────────────────────────────────────────────
+    dfs_l3_reader_worker      →  dfs_l3_reader_worker   (HOST   WORKER)
+    pair_sum_worker           →  pair_sum_worker         (any    WORKER)
+    l4_orchestrate            →  l4_orchestrate          (POD    ORCHESTRATOR)
+    l5_orchestrate            →  l5_orchestrate          (CLOS1  ORCHESTRATOR)
+    l6_orchestrate            →  l6_orchestrate          (CLOS2  ORCHESTRATOR)
+    l7_orchestrate            →  l7_orchestrate          (GLOBAL ORCHESTRATOR)
 
 Grammar reference: machine_hierarchy_and_function_hierarchy.md §5.4, §5.7, §5.8
 
@@ -39,55 +46,161 @@ def l3_data_path(l6: int, l5: int, l4: int, l3: int) -> str:
 
 
 # ===========================================================================
-# WORKER FUNCTIONS (@pl.function with role=WORKER)
+# WORKER FUNCTIONS  (@pl.function with role=WORKER)
 #
-# Workers are pure compute — they never submit further tasks.
+# Workers are pure compute functions; they never submit further tasks.
 # Tensor output storage is allocated by the runtime at submit_worker() time,
 # matching simpler's packed-buffer protocol (§7.3A-1).
 # Only tensor-typed parameters participate in the DAG (§7.3A-2).
+#
+# Maps to:
+#   C++  static void dfs_l3_reader_worker(int l6, ..., LinquTensor out)
+#   C++  static void pair_sum_worker(LinquTensor a, LinquTensor b, LinquTensor out)
 # ===========================================================================
 
 @pl.function(level=Level.HOST, role=Role.WORKER)
-def dfs_l3_reader(path: str, out: Tensor):
+def dfs_l3_reader_worker(l6: int, l5: int, l4: int, l3: int,
+                         out: Tensor):
     """Read one DFS file into the output tensor.
 
-    `path` is a scalar capture invisible to the scheduler.
-    Only `out` is tracked as a DAG output edge.
+    Scalars (l6, l5, l4, l3) are captured via lambda and invisible to the
+    scheduler.  Only ``out`` is tracked as a DAG output edge.
     """
-    with open(path) as f:
+    with open(l3_data_path(l6, l5, l4, l3)) as f:
         for k in range(out.count):
             out[k] = int(f.readline())
 
 
 @pl.function(role=Role.WORKER)
-def pair_sum(a: Tensor, b: Tensor, out: Tensor):
-    """Element-wise sum of two tensors — used as the reduction kernel at every level."""
+def pair_sum_worker(a: Tensor, b: Tensor, out: Tensor):
+    """Element-wise sum of two tensors — used as the tree-reduction kernel."""
+    assert a.count == b.count == out.count
     for k in range(out.count):
         out[k] = a[k] + b[k]
 
 
 # ===========================================================================
-# main — single nested orchestration expressing the full L7→L3 hierarchy.
+# ORCHESTRATOR FUNCTIONS  (@pl.function with role=ORCHESTRATOR)
 #
-# Unlike the pl.at version, worker bodies are NOT embedded inline.
-# Instead, the @pl.function-decorated workers above are referenced by name
-# in submit_worker() and tree_reduce() calls. The orchestration structure
-# is the same nested-parallel-loop pattern.
+# Orchestrators build the task DAG, submit workers (and child orchestrators),
+# and wait on futures.  They never compute data directly.
 #
-# Structure:
-#   L7 orchestrator
-#     └─ for l6: parallel L6 orchestrators
-#          └─ for l5: parallel L5 orchestrators
-#               └─ for l4: parallel L4 orchestrators
-#                    └─ for l3: submit dfs_l3_reader worker
-#                    └─ tree_reduce(pair_sum) at L4
-#               └─ tree_reduce(pair_sum) at L5
-#          └─ tree_reduce(pair_sum) at L6
-#     └─ tree_reduce(pair_sum) at L7
+# Maps to:
+#   C++  static LinquTensor l4_orchestrate(LevelRuntime& rt_l3, ...)
+#   C++  static LinquTensor l5_orchestrate(...)
+#   C++  static LinquTensor l6_orchestrate(...)
+#   C++  L7 inline lambda inside main()
+# ===========================================================================
+
+@pl.function(level=Level.POD, role=Role.ORCHESTRATOR)
+def l4_orchestrate(rt_l3: LevelRuntime, rt_l4: LevelRuntime,
+                   l6: int, l5: int, l4: int) -> Tensor:
+    """L4 orchestrator: submit L3 readers, then tree-reduce their outputs on L4.
+
+    For each child L3 host, submit a dfs_l3_reader_worker.  The resulting
+    tensors are reduced via pl.tree_reduce on the L4 runtime, producing a
+    single tensor with the element-wise sum across all L3 children.
+    """
+    l3_outs: list[Tensor] = []
+    for l3 in range(NUM_L3_PER_L4):
+        out = rt_l3.make_tensor(NUMS_PER_FILE)
+        rt_l3.submit_worker(
+            name="dfs_l3_reader",
+            fn=lambda _l6=l6, _l5=l5, _l4=l4, _l3=l3, _out=out:
+                dfs_l3_reader_worker(_l6, _l5, _l4, _l3, _out),
+            inputs=[],
+            outputs=[out],
+        )
+        l3_outs.append(out)
+
+    return pl.tree_reduce(
+        rt_l4, l3_outs,
+        pair_fn=lambda a, b, out: pair_sum_worker(a, b, out),
+        name="pair_sum",
+    )
+
+
+@pl.function(level=Level.CLOS1, role=Role.ORCHESTRATOR)
+def l5_orchestrate(rt_l3: LevelRuntime, rt_l4: LevelRuntime,
+                   rt_l5: LevelRuntime,
+                   l6: int, l5: int) -> Tensor:
+    """L5 orchestrator: fan out to L4 orchestrators, then tree-reduce on L5."""
+    l4_futures = []
+    for l4 in range(NUM_L4_PER_L5):
+        l4_futures.append(
+            rt_l4.submit_orchestrator(
+                name="l4_orchestrate",
+                fn=lambda _l6=l6, _l5=l5, _l4=l4:
+                    l4_orchestrate(rt_l3, rt_l4, _l6, _l5, _l4),
+            )
+        )
+
+    l4_outs = [f.get() for f in l4_futures]
+
+    return pl.tree_reduce(
+        rt_l5, l4_outs,
+        pair_fn=lambda a, b, out: pair_sum_worker(a, b, out),
+        name="pair_sum",
+    )
+
+
+@pl.function(level=Level.CLOS2, role=Role.ORCHESTRATOR)
+def l6_orchestrate(rt_l3: LevelRuntime, rt_l4: LevelRuntime,
+                   rt_l5: LevelRuntime, rt_l6: LevelRuntime,
+                   l6: int) -> Tensor:
+    """L6 orchestrator: fan out to L5 orchestrators, then tree-reduce on L6."""
+    l5_futures = []
+    for l5 in range(NUM_L5_PER_L6):
+        l5_futures.append(
+            rt_l5.submit_orchestrator(
+                name="l5_orchestrate",
+                fn=lambda _l6=l6, _l5=l5:
+                    l5_orchestrate(rt_l3, rt_l4, rt_l5, _l6, _l5),
+            )
+        )
+
+    l5_outs = [f.get() for f in l5_futures]
+
+    return pl.tree_reduce(
+        rt_l6, l5_outs,
+        pair_fn=lambda a, b, out: pair_sum_worker(a, b, out),
+        name="pair_sum",
+    )
+
+
+@pl.function(level=Level.GLOBAL, role=Role.ORCHESTRATOR)
+def l7_orchestrate(rt_l3: LevelRuntime, rt_l4: LevelRuntime,
+                   rt_l5: LevelRuntime, rt_l6: LevelRuntime,
+                   rt_l7: LevelRuntime) -> Tensor:
+    """L7 (global) orchestrator: fan out to L6, then tree-reduce on L7."""
+    l6_futures = []
+    for l6 in range(NUM_L6):
+        l6_futures.append(
+            rt_l6.submit_orchestrator(
+                name="l6_orchestrate",
+                fn=lambda _l6=l6:
+                    l6_orchestrate(rt_l3, rt_l4, rt_l5, rt_l6, _l6),
+            )
+        )
+
+    l6_outs = [f.get() for f in l6_futures]
+
+    return pl.tree_reduce(
+        rt_l7, l6_outs,
+        pair_fn=lambda a, b, out: pair_sum_worker(a, b, out),
+        name="pair_sum",
+    )
+
+
+# ===========================================================================
+# main — set up runtimes, generate test data, run, verify
+#
+# Maps to:  C++  int main(int argc, char* argv[])
 # ===========================================================================
 
 def main():
     total_l3 = NUM_L6 * NUM_L5_PER_L6 * NUM_L4_PER_L5 * NUM_L3_PER_L4
+
     expected = build_dfs_test_data(total_l3)
 
     rt_l3 = LevelRuntime(level=3, num_scheduler_threads=1, num_worker_threads=4)
@@ -105,79 +218,14 @@ def main():
     for rt in [rt_l3, rt_l4, rt_l5, rt_l6, rt_l7]:
         rt.start()
 
-    # ─── L7: Global Coordinator ─────────────────────────────────────────
-    with pl.at(level=Level.GLOBAL, role=Role.ORCHESTRATOR):
+    top_future = rt_l7.submit_orchestrator(
+        name="l7_orchestrate",
+        fn=lambda: l7_orchestrate(rt_l3, rt_l4, rt_l5, rt_l6, rt_l7),
+    )
 
-        l6_futures = []
-        for l6 in range(NUM_L6):
+    result: Tensor = top_future.get()
 
-            def l6_orch(l6=l6):
-
-                # ─── L6: Cluster-lv2 ────────────────────────────────
-                with pl.at(level=Level.CLOS2, role=Role.ORCHESTRATOR):
-
-                    l5_futures = []
-                    for l5 in range(NUM_L5_PER_L6):
-
-                        def l5_orch(l5=l5):
-
-                            # ─── L5: Supernode ──────────────────────
-                            with pl.at(level=Level.CLOS1, role=Role.ORCHESTRATOR):
-
-                                l4_futures = []
-                                for l4 in range(NUM_L4_PER_L5):
-
-                                    def l4_orch(l4=l4):
-
-                                        # ─── L4: Pod ────────────────
-                                        with pl.at(level=Level.POD, role=Role.ORCHESTRATOR):
-
-                                            # Submit L3 leaf workers
-                                            l3_outs = []
-                                            for l3 in range(NUM_L3_PER_L4):
-                                                out = rt_l3.make_tensor(NUMS_PER_FILE)
-                                                rt_l3.submit_worker(
-                                                    name="dfs_l3_reader",
-                                                    fn=lambda p=l3_data_path(l6, l5, l4, l3), o=out:
-                                                        dfs_l3_reader(p, o),
-                                                    inputs=[],
-                                                    outputs=[out])
-                                                l3_outs.append(out)
-
-                                            return pl.tree_reduce(
-                                                rt_l4, l3_outs,
-                                                pair_sum, "pair_sum")
-
-                                    l4_futures.append(
-                                        rt_l4.submit_orchestrator(
-                                            "l4_orch", l4_orch))
-
-                                l4_outs = [f.get() for f in l4_futures]
-
-                                return pl.tree_reduce(
-                                    rt_l5, l4_outs,
-                                    pair_sum, "pair_sum")
-
-                        l5_futures.append(
-                            rt_l5.submit_orchestrator(
-                                "l5_orch", l5_orch))
-
-                    l5_outs = [f.get() for f in l5_futures]
-
-                    return pl.tree_reduce(
-                        rt_l6, l5_outs,
-                        pair_sum, "pair_sum")
-
-            l6_futures.append(
-                rt_l6.submit_orchestrator("l6_orch", l6_orch))
-
-        l6_outs = [f.get() for f in l6_futures]
-
-        result = pl.tree_reduce(
-            rt_l7, l6_outs,
-            pair_sum, "pair_sum")
-
-    # ─── Verify ─────────────────────────────────────────────────────────
+    # --- Verify element-wise ---
     assert result.count == NUMS_PER_FILE
     for k in range(NUMS_PER_FILE):
         assert result[k] == expected[k], (
