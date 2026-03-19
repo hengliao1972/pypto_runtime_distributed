@@ -135,6 +135,7 @@ if(DAEMON_SRC)
     linqu_add_test(test_query_peers tests/unit/test_query_peers.cpp linqu_daemon_lib)
     linqu_add_test(test_param_passing tests/unit/test_param_passing.cpp linqu_daemon_lib)
     linqu_add_test(test_tensormap_enhanced tests/unit/test_tensormap_enhanced.cpp linqu_runtime_lib linqu_ring linqu_discovery linqu_transport)
+    linqu_add_test(test_task_group tests/unit/test_task_group.cpp linqu_daemon_lib)
 endif()
 
 # ---- Forward Compatibility tests ----

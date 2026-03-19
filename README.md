@@ -26,6 +26,7 @@ Tier 1: Shared Device GM (L0–L2)      — atomics + barriers (simpler, not lin
 All levels share the same `LinquRuntimeOps` function-pointer table. Every `.so` kernel uses the same API regardless of which level it runs at:
 
 - `submit_task` — dispatch a kernel to a target node
+- `submit_task_group` — dispatch N sub-tasks as one dependency-graph node (group task)
 - `scope_begin` / `scope_end` — RAII scope management
 - `alloc_tensor` / `free_tensor` — ring-buffer memory management
 - `query_peers` — discover sibling nodes at a given level
@@ -57,7 +58,7 @@ Requires: C++17, aarch64 (arm64), CMake ≥ 3.16.
 cd build && ctest --output-on-failure -j4
 ```
 
-25+ unit tests covering: core identity, ring buffers, scope/tensormap, orchestrator state, process isolation, dispatchers, discovery, daemon, dispatch engine, topology, DAG computation, ring stress, storage, profiling, forward compatibility, completion wiring, scheduler, ring retirement, back-pressure, query peers, param passing, and enhanced tensormap.
+25+ unit tests covering: core identity, ring buffers, scope/tensormap, orchestrator state, process isolation, dispatchers, discovery, daemon, dispatch engine, topology, DAG computation, ring stress, storage, profiling, forward compatibility, completion wiring, scheduler, ring retirement, back-pressure, query peers, param passing, enhanced tensormap, and group task.
 
 ### E2E Tests
 

@@ -47,8 +47,9 @@ Each `.so` includes only `linqu_orchestration_api.h`. This header defines:
 - `LinquParam`, `LinquParamType` — parameter types
 - `LinquCoordinate_C` — coordinate struct
 - `LinquPeerList` — peer discovery result
+- `LinquSubTaskSpec` — sub-task spec for group submissions
 - `LINQU_SCOPE(rt)` — RAII scope macro
-- Inline wrappers: `linqu_submit_task`, `linqu_scope_begin`, etc.
+- Inline wrappers: `linqu_submit_task`, `linqu_submit_task_group`, `linqu_scope_begin`, etc.
 
 ## Zero Link Dependencies
 
@@ -101,3 +102,43 @@ void linqu_orch_entry(LinquRuntime* rt, uint64_t* args, int arg_count) {
 
 }
 ```
+
+## Group Task Convention
+
+When the compiler emits a multi-device operation (e.g., two L2 chips working as one logical worker), it generates a `linqu_submit_task_group` call instead of multiple `linqu_submit_task` calls. This ensures the N sub-tasks form a single node in the dependency graph.
+
+### Example: L3 Host dispatching to 2 chips as a group
+
+```cpp
+// Inside linqu_orch_entry of an L3 kernel:
+LinquPeerList chips = linqu_query_peers(rt, LINQU_LEVEL_CHIP);
+
+uint64_t input_buf  = args[0];
+uint64_t output_buf = linqu_alloc_tensor(rt, chips.peers[0], 4096);
+
+// Group params: shared INPUT/OUTPUT for dependency tracking
+LinquParam gp[2] = {
+    linqu_make_input(input_buf),
+    linqu_make_output(output_buf),
+};
+
+// Per-chip private params (e.g., shard_id)
+LinquParam p0 = linqu_make_scalar(0);
+LinquParam p1 = linqu_make_scalar(1);
+
+LinquSubTaskSpec subs[2] = {
+    { chips.peers[0], "compute.so", &p0, 1 },
+    { chips.peers[1], nullptr,      &p1, 1 },  // NULL kernel = SPMD (use group kernel)
+};
+
+linqu_submit_task_group(rt, "compute.so", gp, 2, subs, 2);
+
+// Subsequent tasks depending on output_buf automatically depend on the entire group
+linqu_submit_task(rt, chips.peers[0], "next.so",
+                  (LinquParam[]){ linqu_make_input(output_buf) }, 1);
+```
+
+The compiler should emit `submit_task_group` when:
+- A `pl.at()` call targets multiple devices that share input/output tensors
+- The source uses `pl.group()` or equivalent multi-device dispatch syntax
+- SPMD patterns where the same kernel runs on N targets with different shard parameters

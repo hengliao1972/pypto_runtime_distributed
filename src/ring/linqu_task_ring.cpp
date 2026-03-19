@@ -21,6 +21,9 @@ static void reset_descriptor(LinquTaskDescriptor& d) {
     d.fn = nullptr;
     d.fanout_refcount = 0;
     d.fanin_refcount = 0;
+    d.is_group = false;
+    d.group_size = 0;
+    d.sub_complete_count.store(0, std::memory_order_relaxed);
 }
 
 void LinquTaskRing::init(int32_t ws) {

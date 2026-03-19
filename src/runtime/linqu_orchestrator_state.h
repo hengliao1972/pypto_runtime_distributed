@@ -18,6 +18,7 @@
 #include <vector>
 #include <mutex>
 #include <functional>
+#include <unordered_map>
 
 namespace linqu {
 
@@ -44,6 +45,9 @@ public:
 
     void submit_task(LinquCoordinate_C target, const char* kernel_so,
                      LinquParam* params, int num_params);
+    void submit_task_group(const char* kernel_so,
+                           LinquParam* group_params, int num_group_params,
+                           LinquSubTaskSpec* sub_tasks, int num_sub_tasks);
     void scope_begin();
     void scope_end();
     uint64_t alloc_tensor(LinquCoordinate_C target, size_t size_bytes);
@@ -88,6 +92,10 @@ private:
     void propagate_completion(int32_t task_id);
     void check_consumers_ready(int32_t producer_task_id);
     void check_task_consumed(int32_t task_id);
+    void dispatch_group_sub_tasks(int32_t group_tid,
+                                  const char* kernel_so,
+                                  LinquParam* group_params, int num_group_params,
+                                  LinquSubTaskSpec* sub_tasks, int num_sub_tasks);
 
     Level level_ = Level::HOST;
     LinquCoordinate coord_;
@@ -121,6 +129,21 @@ private:
     size_t peak_task_used_ = 0;
     size_t peak_heap_used_ = 0;
     std::vector<RingSnapshot> snapshots_;
+
+    // --- Group task tracking ---
+    // Maps synthetic sub-dispatch IDs (negative) to their parent group task ID.
+    std::unordered_map<int32_t, int32_t> sub_dispatch_to_group_;
+    int32_t next_sub_dispatch_id_ = -1;
+
+    // Pending group specs: stored when a group has unsatisfied fanin deps.
+    struct PendingGroupSpec {
+        std::string kernel_so;
+        std::vector<LinquParam> group_params;
+        std::vector<LinquSubTaskSpec> sub_tasks;
+        // Deep copies of per-sub-task private params
+        std::vector<std::vector<LinquParam>> private_params_storage;
+    };
+    std::unordered_map<int32_t, PendingGroupSpec> pending_group_specs_;
 };
 
 }

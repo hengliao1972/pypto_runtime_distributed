@@ -54,6 +54,15 @@ struct LinquTaskDescriptor {
     // OrchestratorState and existing tests that run single-threaded.
     uint32_t fanout_refcount = 0;
     uint32_t fanin_refcount = 0;
+
+    // --- Group task fields ---
+    // When is_group == true, this task represents a logical group of sub-tasks
+    // dispatched to multiple targets. The group occupies one slot in the
+    // dependency graph. It transitions to COMPLETED only when all sub-tasks
+    // have reported completion (sub_complete_count == group_size).
+    bool     is_group = false;
+    uint32_t group_size = 0;
+    std::atomic<uint32_t> sub_complete_count{0};
 };
 
 struct LinquTaskRing {
