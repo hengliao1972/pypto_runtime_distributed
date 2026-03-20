@@ -85,6 +85,13 @@ static void op_log_impl(LinquRuntime*, const char* fmt, ...) {
 }
 static void* op_get_pool(LinquRuntime*) { return nullptr; }
 
+static void op_submit_task_group(LinquRuntime* rt, const char* kernel_so,
+                                  LinquParam* group_params, int num_group_params,
+                                  LinquSubTaskSpec* sub_tasks, int num_sub_tasks) {
+    hidden_state(rt)->submit_task_group(kernel_so, group_params, num_group_params,
+                                        sub_tasks, num_sub_tasks);
+}
+
 void LinquOrchestratorState::init(Level level, const LinquCoordinate& coord,
                                    const LinquOrchConfig_Internal& cfg) {
     level_ = level;
@@ -116,6 +123,7 @@ void LinquOrchestratorState::init(Level level, const LinquCoordinate& coord,
     ops_.log_info = op_log_impl;
     ops_.log_debug = op_log_impl;
     ops_.get_tensor_pool = op_get_pool;
+    ops_.submit_task_group = op_submit_task_group;
 
     rt_.ops = &ops_;
     hidden_state(&rt_) = this;
@@ -139,6 +147,9 @@ void LinquOrchestratorState::reset() {
     peak_task_used_ = 0;
     peak_heap_used_ = 0;
     snapshots_.clear();
+    sub_dispatch_to_group_.clear();
+    next_sub_dispatch_id_ = -1;
+    pending_group_specs_.clear();
 }
 
 void LinquOrchestratorState::set_dispatcher(LinquDispatcher* d) {
@@ -235,6 +246,23 @@ void LinquOrchestratorState::submit_task(LinquCoordinate_C target,
 
 void LinquOrchestratorState::on_task_complete(int32_t task_id) {
     std::lock_guard<std::mutex> lk(scheduler_mu_);
+
+    // Check if this is a sub-task completion for a group
+    auto it = sub_dispatch_to_group_.find(task_id);
+    if (it != sub_dispatch_to_group_.end()) {
+        int32_t group_tid = it->second;
+        sub_dispatch_to_group_.erase(it);
+
+        auto* group_desc = task_ring_.get(group_tid);
+        uint32_t prev = group_desc->sub_complete_count.fetch_add(1);
+        if (prev + 1 >= group_desc->group_size) {
+            // All sub-tasks done — mark group as COMPLETED
+            group_desc->status = LinquTaskDescriptor::Status::COMPLETED;
+            propagate_completion(group_tid);
+        }
+        return;
+    }
+
     auto* desc = task_ring_.get(task_id);
     if (desc->status == LinquTaskDescriptor::Status::RUNNING) {
         desc->status = LinquTaskDescriptor::Status::COMPLETED;
@@ -272,6 +300,11 @@ void LinquOrchestratorState::propagate_completion(int32_t task_id) {
         fanout_cur = entry ? entry->next : -1;
     }
 
+    // 3) Check if any consumers are now ready (fanin satisfied).
+    //    This is needed for group tasks with fanin > 0 that stay PENDING
+    //    until all producers complete.
+    check_consumers_ready(task_id);
+
     check_task_consumed(task_id);
 }
 
@@ -284,7 +317,30 @@ void LinquOrchestratorState::check_consumers_ready(int32_t producer_task_id) {
             auto* consumer = task_ring_.get(entry->task_id);
             if (consumer->fanin_refcount >= consumer->fanin_count &&
                 consumer->status == LinquTaskDescriptor::Status::PENDING) {
-                consumer->status = LinquTaskDescriptor::Status::READY;
+                if (consumer->is_group) {
+                    // Group task ready — dispatch its sub-tasks
+                    consumer->status = LinquTaskDescriptor::Status::RUNNING;
+                    auto spec_it = pending_group_specs_.find(entry->task_id);
+                    if (spec_it != pending_group_specs_.end()) {
+                        auto& spec = spec_it->second;
+                        // Fixup sub_task pointers to use stored private_params
+                        for (size_t i = 0; i < spec.sub_tasks.size(); i++) {
+                            if (!spec.private_params_storage[i].empty()) {
+                                spec.sub_tasks[i].private_params =
+                                    spec.private_params_storage[i].data();
+                            }
+                        }
+                        dispatch_group_sub_tasks(
+                            entry->task_id, spec.kernel_so.c_str(),
+                            spec.group_params.data(),
+                            static_cast<int>(spec.group_params.size()),
+                            spec.sub_tasks.data(),
+                            static_cast<int>(spec.sub_tasks.size()));
+                        pending_group_specs_.erase(spec_it);
+                    }
+                } else {
+                    consumer->status = LinquTaskDescriptor::Status::READY;
+                }
             }
         }
         cur = entry ? entry->next : -1;
@@ -449,6 +505,152 @@ LinquCoordinate_C LinquOrchestratorState::self_coord() const {
     c.l1_idx = coord_.l1_idx;
     c.l0_idx = coord_.l0_idx;
     return c;
+}
+
+void LinquOrchestratorState::submit_task_group(
+    const char* kernel_so, LinquParam* group_params, int num_group_params,
+    LinquSubTaskSpec* sub_tasks, int num_sub_tasks) {
+
+    // Back-pressure: wait for ring space
+    if (!task_ring_.has_space()) {
+        task_block_count_++;
+        int spins = 0;
+        while (!task_ring_.has_space()) {
+            try_advance_ring_pointers();
+            if (task_ring_.has_space()) break;
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+            if (++spins > 100000) {
+                fprintf(stderr, "[LinquOrchestrator] FATAL: task ring full, "
+                        "no slots freed after 10s. Deadlock?\n");
+                assert(false && "task ring deadlock");
+            }
+        }
+    }
+
+    int32_t tid = task_ring_.alloc();
+    auto* desc = task_ring_.get(tid);
+    desc->kernel_so = kernel_so ? kernel_so : "group";
+    desc->key.task_id = static_cast<uint32_t>(tid);
+    desc->key.scope_depth = static_cast<uint16_t>(
+        scope_stack_.depth() >= 0 ? scope_stack_.depth() : 0);
+
+    // Group fields
+    desc->is_group = true;
+    desc->group_size = static_cast<uint32_t>(num_sub_tasks);
+    desc->sub_complete_count.store(0, std::memory_order_relaxed);
+
+    // Build dependencies from group_params (same logic as submit_task)
+    uint32_t fanin = 0;
+    for (int i = 0; i < num_group_params; i++) {
+        if (group_params[i].type == LINQU_PARAM_INPUT ||
+            group_params[i].type == LINQU_PARAM_INOUT) {
+            auto r = tensor_map_.lookup(group_params[i].handle);
+            if (r.found) {
+                desc->dep_list_head = dep_pool_.prepend(
+                    desc->dep_list_head, r.producer_task_id);
+                auto* producer = task_ring_.get(r.producer_task_id);
+                producer->fanout_count++;
+                producer->fanout_list_head = dep_pool_.prepend(
+                    producer->fanout_list_head, tid);
+                fanin++;
+            }
+        }
+        if (group_params[i].type == LINQU_PARAM_OUTPUT ||
+            group_params[i].type == LINQU_PARAM_INOUT) {
+            tensor_map_.insert(group_params[i].handle, tid);
+        }
+    }
+    desc->fanin_count = fanin;
+
+    // Scope registration
+    if (scope_stack_.depth() >= 0) {
+        scope_stack_.add_task(tid);
+    }
+
+    desc->heap_end = heap_ring_.top();
+    tasks_submitted_++;
+
+    auto tu = static_cast<size_t>(task_ring_.active_count());
+    if (tu > peak_task_used_) peak_task_used_ = tu;
+    auto hu = heap_ring_.used();
+    if (hu > peak_heap_used_) peak_heap_used_ = hu;
+
+    // Empty group: immediately complete
+    if (num_sub_tasks == 0) {
+        desc->status = LinquTaskDescriptor::Status::COMPLETED;
+        propagate_completion(tid);
+        return;
+    }
+
+    if (fanin == 0) {
+        // All deps satisfied — dispatch sub-tasks now
+        desc->status = LinquTaskDescriptor::Status::RUNNING;
+        dispatch_group_sub_tasks(tid, kernel_so, group_params, num_group_params,
+                                 sub_tasks, num_sub_tasks);
+    } else {
+        // Store spec for deferred dispatch when deps are satisfied
+        desc->status = LinquTaskDescriptor::Status::PENDING;
+        PendingGroupSpec spec;
+        spec.kernel_so = kernel_so ? kernel_so : "";
+        spec.group_params.assign(group_params, group_params + num_group_params);
+        spec.sub_tasks.resize(num_sub_tasks);
+        spec.private_params_storage.resize(num_sub_tasks);
+        for (int i = 0; i < num_sub_tasks; i++) {
+            spec.sub_tasks[i] = sub_tasks[i];
+            if (sub_tasks[i].private_params && sub_tasks[i].num_private_params > 0) {
+                spec.private_params_storage[i].assign(
+                    sub_tasks[i].private_params,
+                    sub_tasks[i].private_params + sub_tasks[i].num_private_params);
+                spec.sub_tasks[i].private_params =
+                    spec.private_params_storage[i].data();
+            }
+        }
+        pending_group_specs_[tid] = std::move(spec);
+    }
+}
+
+void LinquOrchestratorState::dispatch_group_sub_tasks(
+    int32_t group_tid, const char* kernel_so,
+    LinquParam* group_params, int num_group_params,
+    LinquSubTaskSpec* sub_tasks, int num_sub_tasks) {
+
+    for (int i = 0; i < num_sub_tasks; i++) {
+        int32_t sub_id = next_sub_dispatch_id_--;
+        sub_dispatch_to_group_[sub_id] = group_tid;
+
+        const char* k = sub_tasks[i].kernel_so ? sub_tasks[i].kernel_so : kernel_so;
+
+        // Merge group_params + private_params
+        std::vector<LinquParam> merged;
+        merged.reserve(num_group_params + sub_tasks[i].num_private_params);
+        for (int j = 0; j < num_group_params; j++)
+            merged.push_back(group_params[j]);
+        for (int j = 0; j < sub_tasks[i].num_private_params; j++)
+            merged.push_back(sub_tasks[i].private_params[j]);
+
+        LinquCoordinate tgt;
+        tgt.l6_idx = sub_tasks[i].target.l6_idx;
+        tgt.l5_idx = sub_tasks[i].target.l5_idx;
+        tgt.l4_idx = sub_tasks[i].target.l4_idx;
+        tgt.l3_idx = sub_tasks[i].target.l3_idx;
+        tgt.l2_idx = sub_tasks[i].target.l2_idx;
+        tgt.l1_idx = sub_tasks[i].target.l1_idx;
+        tgt.l0_idx = sub_tasks[i].target.l0_idx;
+
+        if (dispatcher_) {
+            dispatcher_->dispatch(sub_id, tgt, k ? k : "",
+                                  merged.data(),
+                                  static_cast<int>(merged.size()));
+        } else {
+            // No dispatcher — immediately count as complete
+            uint32_t prev = task_ring_.get(group_tid)->sub_complete_count.fetch_add(1);
+            if (prev + 1 >= static_cast<uint32_t>(num_sub_tasks)) {
+                auto* gdesc = task_ring_.get(group_tid);
+                gdesc->status = LinquTaskDescriptor::Status::COMPLETED;
+                propagate_completion(group_tid);
+            }
+        }
+    }
 }
 
 }

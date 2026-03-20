@@ -38,6 +38,7 @@ The **single header** included by every `.so` kernel at any level. Pure C API wi
 | `wait_all` | `(rt)` | Wait for all dispatched tasks |
 | `dump_ring_snapshot` | `(rt, label)` | Capture ring state for profiling |
 | `log_*` | `(rt, fmt, ...)` | Logging (error/warn/info/debug) |
+| `submit_task_group` | `(rt, kernel_so, group_params, n_gp, sub_tasks, n_sub)` | Submit N sub-tasks as one dependency-graph node |
 
 ### `LinquOrchConfig`
 Every `.so` exports `linqu_orch_config()` returning: `level` (uint8_t), `expected_arg_count` (int).
@@ -53,6 +54,37 @@ RAII scope guard macro. Usage: `LINQU_SCOPE(rt) { ... }` — automatically calls
 
 ### `LinquParam`
 Parameter descriptor: `type` (INPUT/OUTPUT/INOUT/SCALAR), `handle`, `scalar_value`. Convenience constructors: `linqu_make_input()`, `linqu_make_output()`, etc.
+
+### `LinquSubTaskSpec`
+Describes one sub-task within a group submission:
+```c
+typedef struct LinquSubTaskSpec {
+    LinquCoordinate_C target;
+    const char*       kernel_so;          /* NULL = use group-level kernel (SPMD) */
+    LinquParam*       private_params;     /* per-target params (may be NULL) */
+    int               num_private_params;
+} LinquSubTaskSpec;
+```
+
+### `submit_task_group` — Group Task API
+
+Submits N sub-tasks as a single node in the dependency graph. The group occupies one TaskRing slot; downstream tasks that depend on the group's OUTPUT tensors will only become ready after **all** sub-tasks complete.
+
+```c
+void linqu_submit_task_group(LinquRuntime* rt,
+                              const char* kernel_so,        // group-level kernel (SPMD default)
+                              LinquParam* group_params,     // shared INPUT/OUTPUT for dep tracking
+                              int num_group_params,
+                              LinquSubTaskSpec* sub_tasks,   // per-target sub-task specs
+                              int num_sub_tasks);
+```
+
+Key semantics:
+- **Dependency tracking**: `group_params` INPUT/OUTPUT handles build edges in the DAG, same as `submit_task`.
+- **SPMD mode**: If a sub-task's `kernel_so` is NULL, the group-level kernel is used.
+- **Private params**: Each sub-task can carry per-target params (e.g., shard_id), merged with group_params at dispatch time.
+- **Empty group**: `num_sub_tasks == 0` immediately completes.
+- **Sub-task IDs**: Synthetic negative IDs are used internally; they do not occupy TaskRing slots.
 
 ### `.so` Export Contract
 ```cpp
@@ -72,6 +104,8 @@ The central, unified, level-parameterized runtime implementation. One class serv
 void init(Level level, const LinquCoordinate& coord, const LinquOrchConfig_Internal& cfg);
 void reset();
 void submit_task(LinquCoordinate_C target, const char* kernel_so, LinquParam* params, int n);
+void submit_task_group(const char* kernel_so, LinquParam* group_params, int num_group_params,
+                       LinquSubTaskSpec* sub_tasks, int num_sub_tasks);
 void scope_begin();
 void scope_end();
 uint64_t alloc_tensor(LinquCoordinate_C target, size_t size_bytes);

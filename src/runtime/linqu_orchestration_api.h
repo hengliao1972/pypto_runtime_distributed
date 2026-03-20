@@ -78,6 +78,16 @@ typedef struct LinquPeerList {
 typedef struct LinquRuntime LinquRuntime;
 
 /* ====================================================================
+ * LinquSubTaskSpec — describes one sub-task within a group submission
+ * ==================================================================== */
+typedef struct LinquSubTaskSpec {
+    LinquCoordinate_C target;
+    const char*       kernel_so;          /* NULL = use group-level kernel (SPMD) */
+    LinquParam*       private_params;     /* per-target params (may be NULL) */
+    int               num_private_params;
+} LinquSubTaskSpec;
+
+/* ====================================================================
  * LinquRuntimeOps — unified ops table for L3–L6
  *
  * The orchestration .so has zero link deps; all calls go through
@@ -119,6 +129,14 @@ typedef struct LinquRuntimeOps {
     void (*log_debug)(LinquRuntime* rt, const char* fmt, ...);
 
     void* (*get_tensor_pool)(LinquRuntime* rt);
+
+    /* slot 16: group task — submit N sub-tasks as one dependency-graph node */
+    void (*submit_task_group)(LinquRuntime* rt,
+                              const char* kernel_so,
+                              LinquParam* group_params,
+                              int num_group_params,
+                              LinquSubTaskSpec* sub_tasks,
+                              int num_sub_tasks);
 } LinquRuntimeOps;
 
 /* ====================================================================
@@ -203,6 +221,15 @@ static inline void linqu_wait_all(LinquRuntime* rt) {
 }
 static inline void linqu_dump_ring_snapshot(LinquRuntime* rt, const char* label) {
     rt->ops->dump_ring_snapshot(rt, label);
+}
+static inline void linqu_submit_task_group(LinquRuntime* rt,
+                                            const char* kernel_so,
+                                            LinquParam* group_params,
+                                            int num_group_params,
+                                            LinquSubTaskSpec* sub_tasks,
+                                            int num_sub_tasks) {
+    rt->ops->submit_task_group(rt, kernel_so, group_params, num_group_params,
+                               sub_tasks, num_sub_tasks);
 }
 
 #ifdef __cplusplus

@@ -3095,6 +3095,50 @@ Detailed implementation plans for Phases 1–5 will be written when their hardwa
 
 ---
 
+## Milestone 16: Group Task (`submit_task_group`)
+
+**Goal:** Allow multiple sub-tasks to be submitted as a single dependency-graph node. This enables treating N physical L2 devices as one logical worker — downstream tasks only become ready after all sub-tasks complete.
+
+**Motivation:** Inspired by `simpler`'s mix pattern (AIC+VECTOR as one unit). Without this, L3 dispatching to multiple L2 chips produces independent DAG nodes with no way to express "all N must complete before the next step."
+
+### Deliverables
+
+1. **`LinquSubTaskSpec` type** (`linqu_orchestration_api.h`) — per-sub-task target, optional kernel override, optional private params.
+2. **`submit_task_group` ops slot** (slot 16 in `LinquRuntimeOps`) — inline wrapper in the API header.
+3. **`LinquTaskDescriptor` group fields** (`linqu_task_ring.h`) — `is_group`, `group_size`, `sub_complete_count` (atomic).
+4. **`LinquOrchestratorState::submit_task_group()`** — allocates one TaskRing slot, builds deps from group_params, dispatches sub-tasks with synthetic negative IDs.
+5. **Completion aggregation** in `on_task_complete()` — routes negative sub-dispatch IDs to group, triggers group COMPLETED when all sub-tasks done.
+6. **Deferred dispatch** via `PendingGroupSpec` — when group has unsatisfied fanin deps, sub-tasks are dispatched only after deps are met.
+7. **6 unit tests** (`test_task_group.cpp`) — basic group, DAG dependencies, scope retire, SPMD, empty group, private params.
+
+### Key Design Decisions
+
+- One TaskRing slot per group (not N), keeping ring pressure constant.
+- Negative synthetic dispatch IDs for sub-tasks to avoid collision with TaskRing's positive IDs.
+- Deep copy of `PendingGroupSpec` to avoid dangling pointers when group has deferred dispatch.
+- Empty group (0 sub-tasks) immediately completes.
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `src/runtime/linqu_orchestration_api.h` | `LinquSubTaskSpec`, ops slot 16, inline wrapper |
+| `src/ring/linqu_task_ring.h` | 3 new fields on `LinquTaskDescriptor` |
+| `src/ring/linqu_task_ring.cpp` | Reset logic for new fields |
+| `src/runtime/linqu_orchestrator_state.h` | New methods and members |
+| `src/runtime/linqu_orchestrator_state.cpp` | Core implementation |
+| `tests/unit/test_task_group.cpp` | 6 unit tests |
+| `CMakeLists.txt` | Test target |
+
+### Acceptance Criteria
+
+- All 6 group task tests pass.
+- All pre-existing tests (30 total) continue to pass.
+- Group tasks correctly participate in DAG dependency chains (fanin/fanout).
+- SPMD mode (NULL kernel_so) uses group-level kernel for all sub-tasks.
+
+---
+
 ## Appendix: Three-Tier Communication Model Reference
 
 This appendix summarizes the three-tier communication architecture that governs all cross-level data flow in the Linqu system. See `linqu_runtime_design.md` §7.4 for the full specification.
